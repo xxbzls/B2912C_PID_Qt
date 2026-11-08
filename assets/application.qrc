@@ -1,0 +1,11 @@
+<RCC>
+  <qresource prefix="/icons">
+    <file alias="probe-control.ico">probe-control.ico</file>
+    <file>chevron-down.svg</file>
+    <file>chevron-up.svg</file>
+    <file>check.svg</file>
+  </qresource>
+  <qresource prefix="/styles">
+    <file>app.qss</file>
+  </qresource>
+</RCC>

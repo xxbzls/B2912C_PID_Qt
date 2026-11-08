@@ -1,0 +1,49 @@
+# Qt/qmake local state and generated files
+.qtc_clangd/
+.qmake.stash
+*.pro.user*
+Makefile*
+*.o
+moc/
+obj/
+qrc_*.cpp
+*_resource.rc
+
+# Build and deployment outputs
+build/
+build-*/
+bin/
+debug/
+release/
+dist/
+*.exe
+*.dll
+*.a
+*.lib
+
+# Generated test and analysis data
+tests/results/
+tests/__pycache__/
+tests/*build-log.txt
+stability-test/test-results*/
+stability-test/*verification.json
+analysis/
+tmp/
+ubg/
+*.log
+*.pyc
+object_script.*
+
+# Historical snapshots and packaged copies
+backups/
+B2912C_PID_v1.0/
+B2912C_StabilityTest_v1.0/
+*.rar
+*.zip
+
+# Editor and operating-system clutter
+.vs/
+.vscode/
+*.user
+Thumbs.db
+.DS_Store

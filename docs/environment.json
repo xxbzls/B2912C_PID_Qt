@@ -1,0 +1,16 @@
+{
+  "verifiedOn": "2026-09-16",
+  "platform": "Windows 10 x64",
+  "qtVersion": "5.15.2",
+  "qtRoot": "D:/Qt/qt5.15.2-mingw64",
+  "compiler": "MinGW-w64 GCC 8.1.0 x86_64-posix-seh",
+  "compilerRoot": "C:/mingw64",
+  "qtCreator": "C:/Qt/qtcreator-12.0.2/bin/qtcreator.exe",
+  "iviRoot": "C:/Program Files/IVI Foundation/IVI",
+  "iviDriver": "KtB2900 IVI-C 1.1.0 x64",
+  "driverInstaller": "KtB2900-IviC-x64_1.1.0.4.msi",
+  "realHardwareTested": false,
+  "startupMode": "position-plant-simulation",
+  "environmentScope": "Build scripts set variables for their process; no global environment changes",
+  "projectRoot": "F:/B2912C_PID_Qt"
+}
