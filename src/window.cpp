@@ -32,7 +32,7 @@ void Window::testConnection() {
     }
     hadError=false;sessionReady=false;
     Settings connection;connection.mode=driverSimulation ? 1 : 2;connection.resource=resource->text().trimmed();
-    connection.nplc=nplc->value();connection.periodMs=period->value();
+    connection.nplc=nplc->value();connection.periodMs=period->value();connection.probeVoltageLimit=probeVoltageLimit->value();
     session=new SessionThread(connection,this);
     refreshControls();
     showConnectionStatus(simulation ? "正在连接模拟驱动……" : "正在连接 B2912C……","#536575");
@@ -70,7 +70,7 @@ void Window::refreshControls() {
         && !activeSettings.manual;
     parameters->setEnabled(!waiting && !closing);
     for(auto* w : {kp,ti,td}) w->setEnabled(editable);
-    for(auto* w : {limit,nplc,manual}) w->setEnabled(editable);
+    for(auto* w : {limit,probeVoltageLimit,nplc,manual}) w->setEnabled(editable);
     direction->setEnabled(editable);period->setEnabled(editable);
     overrideVoltageLimit->setEnabled(editable);
     voltageLimit->setEnabled(editable && overrideVoltageLimit->isChecked());
@@ -116,7 +116,7 @@ void Window::start(bool isManual) {
     if(!session || !sessionReady) {
         append("请先成功连接电源，再启动控制。");return;
     }
-    Settings s;s.mode=driverSimulation ? 1 : 2;s.resource=resource->text();s.targetV=target->value();s.kp=kp->value();s.ti=ti->value();s.td=td->value();s.limitMA=limit->value();s.voltageLimit=voltageLimit->value();s.overrideVoltageLimit=overrideVoltageLimit->isChecked();s.nplc=nplc->value();s.manualMA=manual->value();s.direction=direction->currentIndex()==0?1:-1;s.periodMs=period->value();s.manual=isManual;
+    Settings s;s.mode=driverSimulation ? 1 : 2;s.resource=resource->text();s.targetV=target->value();s.kp=kp->value();s.ti=ti->value();s.td=td->value();s.limitMA=limit->value();s.probeVoltageLimit=probeVoltageLimit->value();s.voltageLimit=voltageLimit->value();s.overrideVoltageLimit=overrideVoltageLimit->isChecked();s.nplc=nplc->value();s.manualMA=manual->value();s.direction=direction->currentIndex()==0?1:-1;s.periodMs=period->value();s.manual=isManual;
     s.currentTest=false;
     try{s.validate();}catch(const std::exception& e){hadError=true;append(QString::fromUtf8(e.what()));return;}
     hadError=false;sampleCount=0;activeSettings=s;active=true;preparingControl=true;stopping=false;targetPending=false;storageFailed=false;
@@ -172,6 +172,10 @@ void Window::applyTarget() {
     if(!target->hasAcceptableInput()) {append("目标未应用：请输入 -10～+10 V 范围内的有效电压。");return;}
     target->interpretText();
     const double volts=target->value();
+    if(std::abs(volts)>activeSettings.probeVoltageLimit) {
+        append(QString("目标未应用：目标电压不得超过探头保护阈值 ±%1 V。")
+               .arg(activeSettings.probeVoltageLimit,0,'g',8));return;
+    }
     if(volts==activeSettings.targetV) return;
     if(!session->requestTargetVoltage(volts)) {append("目标未应用：PID 已停止或当前无法接受更新。");return;}
     targetPending=true;refreshControls();
@@ -190,6 +194,7 @@ void Window::attachSignals(ControlThread* thread) {
     connect(thread,&ControlThread::targetApplied,this,[this](double volts){
         targetPending=false;
         append(QString("目标电压已应用：%1 V，PID 持续运行。").arg(volts,0,'f',4));
+        refreshControls();
         // The following sample carries the exact target used for that computation.
     });
     connect(thread,&ControlThread::sample,this,[this](double t,double v,double command,double measured,double dt,double targetV){
@@ -200,14 +205,16 @@ void Window::attachSignals(ControlThread* thread) {
         const QString prefix=s.mode==2 ? "" : "【仿真数据】 ";
         probeReading->setText(QString::number(v,'f',5));targetReading->setText(QString::number(s.targetV,'f',5));
         outputReading->setText(QString::number(command,'f',4));measuredReading->setText(QString::number(measured,'f',4));
-        probeReading->setToolTip("CH1 最新采集的探头反馈电压。");
-        outputReading->setToolTip("实际下发至 CH2 的控制电流。");
-        measuredReading->setToolTip("CH2 输出开启时采集的实测电流。");currentTrace->setToolTip("");
+        if(sampleCount==1) {
+            probeReading->setToolTip("CH1 最新采集的探头反馈电压。");
+            outputReading->setToolTip("实际下发至 CH2 的控制电流。");
+            measuredReading->setToolTip("CH2 输出开启时采集的实测电流。");currentTrace->setToolTip("");
+            refreshControls();
+        }
         values->setText(prefix+QString("电压误差 %1 V    ·    实际周期 %2 ms").arg(s.targetV-v,0,'f',5).arg(dt,0,'f',1));
         values->setAccessibleDescription(prefix+QString("CH1 探头电压 %1 V  |  目标电压 %2 V  |  电压误差 %3 V\nCH2 输出电流 %4 mA  |  实测电流 %5 mA  |  实际周期 %6 ms").arg(v,0,'f',5).arg(s.targetV,0,'f',5).arg(s.targetV-v,0,'f',5).arg(command,0,'f',4).arg(measured,0,'f',4).arg(dt,0,'f',1));
         trace->appendSample(t,v,targetV);
         currentTrace->appendCurrentSample(t,command,measured);
-        refreshControls();
     });
     connect(thread,&ControlThread::monitorSample,this,[this](double t,double v,double dt){
         if(!sessionReady || active || hadError || closing) return;

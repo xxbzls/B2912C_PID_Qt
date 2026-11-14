@@ -4,13 +4,13 @@
 // Sampled software protection. A fault is latched for the lifetime of a run.
 class MeasurementProtection {
 public:
-    MeasurementProtection(double limitMA, int periodMs);
+    MeasurementProtection(double limitMA, int periodMs, double feedbackLimitV = 15.0);
     void checkFeedback(double volts);
     void checkCurrent(double commandMA, double measuredMA, double elapsedSeconds);
     double currentToleranceMA() const;
     double mismatchDurationSeconds() const;
 private:
-    double limit, period, mismatchSince = -1, previousTime = -1;
+    double limit, feedbackLimit, period, mismatchSince = -1, previousTime = -1;
     int mismatchSamples = 0;
     QString fault;
     void checkLatched() const;

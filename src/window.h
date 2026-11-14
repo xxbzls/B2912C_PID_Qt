@@ -45,7 +45,7 @@ private:
     QWidget* parameters;
     QComboBox* direction;
     QLineEdit* resource;
-    QDoubleSpinBox *target, *kp, *ti, *td, *limit, *voltageLimit, *nplc, *manual;
+    QDoubleSpinBox *target, *kp, *ti, *td, *limit, *probeVoltageLimit, *voltageLimit, *nplc, *manual;
     QSpinBox* period;
     QCheckBox* saveData;
     QComboBox* storageFrequency;

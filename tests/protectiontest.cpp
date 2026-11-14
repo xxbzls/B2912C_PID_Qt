@@ -41,7 +41,7 @@ public:
     }
     QStringList stopControlOutput() override {s.on[1]=false;return {};}
     double readVoltage() override {
-        return s.fault==Fault::HighFeedback ? 10.0001 : s.fault==Fault::LowFeedback ? -10.0001 : 0;
+        return s.fault==Fault::HighFeedback ? 15.0001 : s.fault==Fault::LowFeedback ? -15.0001 : 0;
     }
     double readCurrent() override {
         ++s.measurements;
@@ -116,21 +116,25 @@ int protectionTest() {
         try { action(); } catch(const std::exception&) { return true; } return false;
     };
     try {
-        MeasurementProtection boundary(1,100);
-        for (double volts : {-10.0,0.0,10.0}) boundary.checkFeedback(volts);
-        require(true,"Accept feedback endpoints +/-10 V");
-        for (double volts : {-10.000001,10.000001}) {
-            MeasurementProtection monitor(1,100);
-            require(rejects([&]{monitor.checkFeedback(volts);}),"Reject feedback outside +/-10 V");
-            require(rejects([&]{monitor.checkFeedback(0);}),"Voltage fault stays latched after signal recovers");
-            require(rejects([&]{monitor.checkCurrent(0,0,1);}),"Voltage fault blocks subsequent current checks");
+        for (double threshold : {0.1,7.5,15.0}) {
+            MeasurementProtection boundary(1,100,threshold);
+            for (double volts : {-threshold,0.0,threshold}) boundary.checkFeedback(volts);
+            require(true,QString("Accept feedback endpoints at configurable +/- %1 V").arg(threshold));
+            for (double volts : {-threshold-0.000001,threshold+0.000001}) {
+                MeasurementProtection monitor(1,100,threshold);
+                require(rejects([&]{monitor.checkFeedback(volts);}),"Reject feedback outside the configured symmetric threshold");
+                require(rejects([&]{monitor.checkFeedback(0);}),"Voltage fault stays latched after signal recovers");
+                require(rejects([&]{monitor.checkCurrent(0,0,1);}),"Voltage fault blocks subsequent current checks");
+            }
         }
+        require(rejects([&]{MeasurementProtection invalid(1,100,15.0001);}),
+                "Reject software thresholds above the 15 V limit protected by the 17 V hardware backstop");
         for (double invalid : {std::numeric_limits<double>::quiet_NaN(),std::numeric_limits<double>::infinity()}) {
             MeasurementProtection voltage(1,100), current(1,100);
             require(rejects([&]{voltage.checkFeedback(invalid);}),"Invalid feedback trips");
             require(rejects([&]{current.checkCurrent(0,invalid,0);}),"Invalid measured current trips");
         }
-        for (double limit : {0.1,1.0,10.0}) {
+        for (double limit : {0.1,1.0,10.0,100.0}) {
             for (int sign : {-1,1}) {
                 MeasurementProtection monitor(limit,100);
                 monitor.checkCurrent(sign*limit,sign*(limit+0.0005),0);
@@ -271,7 +275,7 @@ int protectionTest() {
             require(true,"Read back hardware protection ON, auto-on OFF, auto-off OFF on both channels");
             instrument.enable();instrument.setCurrent(0.001);
             require(std::abs(instrument.currentSetting()-0.001)<1e-10,"1 mA is sent as 0.001 A");
-            require(rejects([&]{instrument.setCurrent(0.0011);}),"Driver wrapper enforces configured 1 mA limit as well as absolute 10 mA cap");
+            require(rejects([&]{instrument.setCurrent(0.0011);}),"Driver wrapper enforces the configured 1 mA limit even though the absolute cap is 100 mA");
             require(rejects([&]{instrument.setCurrent(-0.0011);}),"Negative command cannot bypass driver limit");
             instrument.readCurrent();
             require(instrument.outputEnabled(2),"Acquisition keeps continuous output enabled");

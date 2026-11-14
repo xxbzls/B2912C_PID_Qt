@@ -1,5 +1,4 @@
 #include "traceplot.h"
-#include <QLabel>
 #include <QTimer>
 #include <QApplication>
 #include <algorithm>
@@ -7,10 +6,13 @@
 
 TracePlot::TracePlot(QWidget* parent) : QCustomPlot(parent) {
     setMinimumHeight(150);
-    setMouseTracking(true);
+    // Button-drag events are still delivered without mouse tracking. Avoid
+    // processing every passive mouse move over a large, dense plot.
+    setMouseTracking(false);
     setBackground(Qt::white);
     setPlottingHint(QCP::phCacheLabels,true);
     setPlottingHint(QCP::phFastPolylines,true);
+    setNoAntialiasingOnDrag(true);
     for(auto* axis:{xAxis,yAxis}) {
         axis->setBasePen(QPen(QColor("#cedbe6")));
         axis->setTickPen(QPen(QColor("#cedbe6")));
@@ -20,7 +22,9 @@ TracePlot::TracePlot(QWidget* parent) : QCustomPlot(parent) {
         axis->grid()->setPen(QPen(QColor("#e6edf3"),1,Qt::DotLine));axis->grid()->setZeroLinePen(QPen(QColor("#d3dfe9")));
     }
     setInteractions(QCP::iRangeDrag | QCP::iRangeZoom);
-    axisRect()->setRangeDrag(Qt::Horizontal | Qt::Vertical);
+    // Live time is authoritative: dragging may adjust Y, but must never pan X
+    // away from the newest sample at the right edge.
+    axisRect()->setRangeDrag(Qt::Vertical);
     axisRect()->setRangeZoom(Qt::Horizontal | Qt::Vertical);
     axisRect()->setRangeZoomFactor(0.85);
     auto timeTicker=QSharedPointer<QCPAxisTickerTime>::create();
@@ -28,18 +32,27 @@ TracePlot::TracePlot(QWidget* parent) : QCustomPlot(parent) {
     timeTicker->setTickCount(5);
     xAxis->setTicker(timeTicker);
     xAxis->setLabel("时间（时:分:秒）");
-    connect(this,&QCustomPlot::beforeReplot,this,[this,timeTicker]{
+    connect(this,&QCustomPlot::beforeReplot,this,
+            [this,timeTicker,lastMilliseconds=false,lastTickCount=-1,lastRightMargin=-1]() mutable {
         const bool milliseconds=xAxis->range().size()<5;
-        timeTicker->setTimeFormat(milliseconds ? "%h:%m:%s.%z" : "%h:%m:%s");
-        xAxis->setLabel(milliseconds ? "时间（时:分:秒.毫秒）" : "时间（时:分:秒）");
+        if(milliseconds!=lastMilliseconds) {
+            timeTicker->setTimeFormat(milliseconds ? "%h:%m:%s.%z" : "%h:%m:%s");
+            xAxis->setLabel(milliseconds ? "时间（时:分:秒.毫秒）" : "时间（时:分:秒）");
+            lastMilliseconds=milliseconds;
+        }
         const int labelWidth=QFontMetrics(xAxis->tickLabelFont()).horizontalAdvance(
             milliseconds ? "00:00:00.000" : "00:00:00");
-        timeTicker->setTickCount(qBound(2,(width()-100)/(labelWidth+28),6));
-        axisRect()->setMinimumMargins(QMargins(0,0,labelWidth/2+8,0));
+        const int tickCount=qBound(2,(width()-100)/(labelWidth+28),6);
+        if(tickCount!=lastTickCount) {timeTicker->setTickCount(tickCount);lastTickCount=tickCount;}
+        const int rightMargin=labelWidth/2+8;
+        if(rightMargin!=lastRightMargin) {
+            axisRect()->setMinimumMargins(QMargins(0,0,rightMargin,0));
+            lastRightMargin=rightMargin;
+        }
     });
     yAxis->setLabel("电压（V）");
-    addGraph(); graph(0)->setName("探头电压"); graph(0)->setPen(QPen(QColor("#098c95"),2));
-    addGraph(); graph(1)->setName("目标电压"); graph(1)->setPen(QPen(QColor("#d58a28"),1.5,Qt::DashLine));
+    addGraph(); graph(0)->setName("探头电压"); graph(0)->setPen(QPen(QColor("#098c95"),1.2));
+    addGraph(); graph(1)->setName("目标电压"); graph(1)->setPen(QPen(QColor("#d58a28"),1.2,Qt::DashLine));
     graph(1)->setLineStyle(QCPGraph::lsStepLeft);
     // Every retained one-second mean must remain a real polyline vertex.
     // Performance is handled by coalescing repaints, not by dropping points.
@@ -52,16 +65,10 @@ TracePlot::TracePlot(QWidget* parent) : QCustomPlot(parent) {
     // Store each completed one-second average and coalesce screen paints.
     redrawTimer=new QTimer(this);
     redrawTimer->setSingleShot(true);
-    redrawTimer->setInterval(200);
+    // Voltage and current means complete together. Stagger their paints so
+    // two dense widgets never block the GUI thread back-to-back.
+    redrawTimer->setInterval(120);
     connect(redrawTimer,&QTimer::timeout,this,[this]{
-        if(!autoFollow) return;
-        if(hovering) updateHover(hoverPixel);
-        replot(QCustomPlot::rpQueuedReplot);
-    });
-    hoverTimer=new QTimer(this);
-    hoverTimer->setSingleShot(true);
-    hoverTimer->setInterval(50);
-    connect(hoverTimer,&QTimer::timeout,this,[this]{
         replot(QCustomPlot::rpQueuedReplot);
     });
     legend->setVisible(true);
@@ -82,23 +89,16 @@ TracePlot::TracePlot(QWidget* parent) : QCustomPlot(parent) {
     connect(xAxis,qOverload<const QCPRange&>(&QCPAxis::rangeChanged),this,[this](const QCPRange&){
         updateTargetLine();
     });
-    cursorLine = new QCPItemStraightLine(this);
-    cursorLine->setPen(QPen(QColor("#8797a5"),1,Qt::DotLine));
-    marker = new QCPItemTracer(this);
-    marker->setGraph(graph(0)); marker->setInterpolating(false);
-    marker->setStyle(QCPItemTracer::tsCircle); marker->setSize(8);
-    marker->setPen(QPen(QColor("#098c95"),2)); marker->setBrush(Qt::white);
-    hoverLabel = new QLabel(this);
-    hoverLabel->setObjectName("plotHoverData");
-    hoverLabel->setAttribute(Qt::WA_TransparentForMouseEvents);
-    hoverLabel->setStyleSheet("QLabel {background:#ffffff;color:#15334b;border:1px solid #95afc2;border-radius:4px;padding:6px;}");
     resetData(targetValue);
 }
 void TracePlot::setCurrentMode(bool enabled) {
     currentMode=enabled;
+    redrawTimer->setInterval(enabled ? 620 : 120);
     yAxis->setLabel(enabled ? "电流（mA）" : "电压（V）");
     graph(0)->setName(enabled ? "输出电流" : "探头电压");
     graph(1)->setName(enabled ? "实测电流" : "目标电压");
+    graph(0)->setPen(QPen(QColor("#098c95"),1.2));
+    graph(1)->setPen(QPen(QColor("#d58a28"),1.2,enabled ? Qt::SolidLine : Qt::DashLine));
     graph(1)->setLineStyle(enabled ? QCPGraph::lsLine : QCPGraph::lsStepLeft);
     resetData(enabled ? 0 : targetValue);
 }
@@ -107,16 +107,14 @@ void TracePlot::resetData(double target) {
     graph(1)->setData(liveData[1]);
     targetValue=target;
     targetHistory.clear();
-    pausedTargetHistory.clear();
-    pausedTargetValue=target;
     averaging={};
     lastSampleTime=-std::numeric_limits<double>::infinity();
-    minimums.clear();maximums.clear();redrawTimer->stop();hoverTimer->stop();
+    minimums.clear();maximums.clear();redrawTimer->stop();
     liveData[0]->clear();
     liveData[1]->clear();
     autoFollow=true;
     manualYRange=false;
-    hideHover();
+    followWindowSeconds=0;
     fitLatest();
     // Target may change without the x range changing.
     updateTargetLine();
@@ -142,7 +140,7 @@ void TracePlot::appendSample(double seconds,double value,double target) {
     // Targets are commands, not measurements: preserve their actual step times.
     if(targetChanged) {
         updateTargetLine();
-        if(autoFollow && !redrawTimer->isActive()) redrawTimer->start();
+        if(!redrawTimer->isActive()) redrawTimer->start();
     }
     accumulateSample(seconds,value);
 }
@@ -181,7 +179,7 @@ void TracePlot::finishSample(double seconds,double lower,double upper) {
         targetHistory.erase(targetHistory.begin());
     if (autoFollow) fitLatest();
     updateTargetLine();
-    if(autoFollow && !redrawTimer->isActive()) redrawTimer->start();
+    if(!redrawTimer->isActive()) redrawTimer->start();
 }
 double TracePlot::targetAt(double seconds) const {
     if(targetHistory.isEmpty()) return targetValue;
@@ -190,18 +188,13 @@ double TracePlot::targetAt(double seconds) const {
     return it.value();
 }
 double TracePlot::displayedTargetAt(double seconds) const {
-    if(autoFollow) return targetAt(seconds);
-    if(pausedTargetHistory.isEmpty()) return pausedTargetValue;
-    auto it=pausedTargetHistory.upperBound(seconds);
-    if(it!=pausedTargetHistory.constBegin()) --it;
-    return it.value();
+    return targetAt(seconds);
 }
 void TracePlot::updateTargetLine() {
     if(currentMode) return;
     const auto range=xAxis->range();
-    const auto& shownTargets=autoFollow ? targetHistory : pausedTargetHistory;
     QVector<double> times{range.lower},values{displayedTargetAt(range.lower)};
-    for(auto it=shownTargets.upperBound(range.lower);it!=shownTargets.constEnd() && it.key()<range.upper;++it) {
+    for(auto it=targetHistory.upperBound(range.lower);it!=targetHistory.constEnd() && it.key()<range.upper;++it) {
         times.append(it.key());values.append(it.value());
     }
     times.append(range.upper);values.append(displayedTargetAt(range.upper));
@@ -211,8 +204,15 @@ void TracePlot::fitLatest() {
     const auto data=liveData[0];
     double left=0,right=10;
     if (!data->isEmpty()) {
-        right=std::max(data->constBegin()->key+10.0,(data->constEnd()-1)->key);
-        left=std::max(data->constBegin()->key,right-historySeconds);
+        const double first=data->constBegin()->key;
+        const double latest=(data->constEnd()-1)->key;
+        if(followWindowSeconds>0) {
+            right=latest;
+            left=right-followWindowSeconds;
+        } else {
+            right=std::max(first+10.0,latest);
+            left=std::max(first,right-historySeconds);
+        }
     }
     double lower=minimums.empty() ? (currentMode ? 0 : targetValue) : minimums.front().second;
     double upper=maximums.empty() ? lower : maximums.front().second;
@@ -221,115 +221,65 @@ void TracePlot::fitLatest() {
     const double padding=std::max({(upper-lower)*0.12,
         std::max(std::abs(lower),std::abs(upper))*1e-6,1e-9});
     xAxis->setRange(left,right);
-    if(!manualYRange) yAxis->setRange(lower-padding,upper+padding);
+    if(manualYRange) yAxis->setRange(lockedYRange);
+    else yAxis->setRange(lower-padding,upper+padding);
 }
 void TracePlot::restoreView() {
     manualYRange=false;
+    followWindowSeconds=0;
     graph(0)->setData(liveData[0]);
     graph(1)->setData(liveData[1]);
     autoFollow=true;
-    pausedTargetHistory.clear();
-    hideHover();fitLatest();updateTargetLine();replot();
-}
-void TracePlot::pauseView() {
-    if(!autoFollow) return;
-    redrawTimer->stop();
-    pausedTargetHistory=targetHistory;
-    pausedTargetValue=targetValue;
-    graph(0)->setData(QSharedPointer<QCPGraphDataContainer>(new QCPGraphDataContainer(*liveData[0])));
-    graph(1)->setData(QSharedPointer<QCPGraphDataContainer>(new QCPGraphDataContainer(*liveData[1])));
-    autoFollow=false;
-    hideHover();
-}
-void TracePlot::hideHover() {
-    hovering=false;hoverKey=std::numeric_limits<double>::quiet_NaN();
-    hoverLabel->hide();marker->setVisible(false);cursorLine->setVisible(false);
-}
-void TracePlot::scheduleHover(QPoint pixel) {
-    hoverPixel=pixel;
-    const bool wasHovering=hovering;
-    const double previousKey=hoverKey;
-    updateHover(hoverPixel);
-    if(wasHovering!=hovering) {
-        hoverTimer->stop();
-        replot(QCustomPlot::rpQueuedReplot);
-        return;
-    }
-    const bool keyChanged=hovering && (!std::isfinite(previousKey) || previousKey!=hoverKey);
-    if(keyChanged && !hoverTimer->isActive()) hoverTimer->start();
-}
-void TracePlot::updateHover(QPoint pixel) {
-    const auto data=graph(0)->data();
-    if(!axisRect()->rect().contains(pixel) || data->isEmpty()) {hideHover();return;}
-    const double key=xAxis->pixelToCoord(pixel.x());
-    auto it=data->findBegin(key,false);
-    if(it==data->constEnd()) --it;
-    else if(it!=data->constBegin() && std::abs((it-1)->key-key)<std::abs(it->key-key)) --it;
-    // Only show retained samples visible in the current time range.
-    if(!xAxis->range().contains(it->key)) {hideHover();return;}
-    hovering=true;hoverPixel=pixel;hoverKey=it->key;
-    marker->setGraphKey(it->key);marker->updatePosition();marker->setVisible(true);
-    cursorLine->point1->setCoords(it->key,0);cursorLine->point2->setCoords(it->key,1);cursorLine->setVisible(true);
-    if(currentMode) {
-        const auto measured=graph(1)->data()->findBegin(it->key,false);
-        const QString measuredText=measured!=graph(1)->data()->constEnd() && measured->key==it->key
-            ? QString::number(measured->value,'f',6) : "--";
-        hoverLabel->setText(QString("1秒平均值\n时间窗：[%1, %2) s\n输出电流：%3 mA\n实测电流：%4 mA")
-            .arg(it->key-1,0,'f',0).arg(it->key,0,'f',0).arg(it->value,0,'f',6).arg(measuredText));
-    } else {
-        const double shownTarget=displayedTargetAt(it->key);
-        hoverLabel->setText(QString("1秒平均值\n时间窗：[%1, %2) s\n探头电压：%3 V\n目标电压（窗末时刻）：%4 V\n电压误差（目标−均值）：%5 V")
-            .arg(it->key-1,0,'f',0).arg(it->key,0,'f',0).arg(it->value,0,'f',6).arg(shownTarget,0,'f',6).arg(shownTarget-it->value,0,'f',6));
-    }
-    hoverLabel->adjustSize();
-    int x=pixel.x()+15,y=pixel.y()+15;
-    if(x+hoverLabel->width()>width()-5)x=pixel.x()-hoverLabel->width()-15;
-    if(y+hoverLabel->height()>height()-5)y=pixel.y()-hoverLabel->height()-15;
-    hoverLabel->move(std::max(5,x),std::max(5,y));hoverLabel->show();hoverLabel->raise();
+    fitLatest();updateTargetLine();replot();
 }
 void TracePlot::mousePressEvent(QMouseEvent* event) {
     if(event->button()==Qt::LeftButton && axisRect()->rect().contains(event->pos())) {
         dragCandidate=true;
+        dragInProgress=false;
         dragStartPixel=event->pos();
     }
     QCustomPlot::mousePressEvent(event);
 }
 void TracePlot::mouseReleaseEvent(QMouseEvent* event) {
+    const bool completedDrag=event->button()==Qt::LeftButton && dragInProgress;
     QCustomPlot::mouseReleaseEvent(event);
-    if(event->button()==Qt::LeftButton) dragCandidate=false;
+    if(event->button()==Qt::LeftButton) {dragCandidate=false;dragInProgress=false;}
+    if(completedDrag) {
+        // Preserve the selected time span and locked Y range, and explicitly
+        // reaffirm the newest sample at the right edge after Y dragging.
+        followWindowSeconds=qBound(0.01,xAxis->range().size(),historySeconds);
+        autoFollow=true;
+        fitLatest();updateTargetLine();replot(QCustomPlot::rpQueuedReplot);
+    }
 }
 void TracePlot::mouseMoveEvent(QMouseEvent* event) {
-    if(event->buttons().testFlag(Qt::LeftButton) && dragCandidate
-        && (event->pos()-dragStartPixel).manhattanLength()>=QApplication::startDragDistance()) {
-        pauseView();
+    const bool manualDrag=event->buttons().testFlag(Qt::LeftButton) && dragCandidate
+        && (event->pos()-dragStartPixel).manhattanLength()>=QApplication::startDragDistance();
+    if(manualDrag) {
+        dragInProgress=true;
         manualYRange=true;
     }
     QCustomPlot::mouseMoveEvent(event);
-    if(event->buttons()==Qt::NoButton) {
-        scheduleHover(event->pos());
-    } else {
-        hoverTimer->stop();
-        hideHover();
-        // QCustomPlot already repaints while a range is being dragged.
-    }
+    if(manualDrag) lockedYRange=yAxis->range();
 }
 void TracePlot::wheelEvent(QWheelEvent* event) {
-    if(axisRect()->rect().contains(event->position().toPoint())) {
-        pauseView();
+    const bool inside=axisRect()->rect().contains(event->position().toPoint());
+    const bool wasFollowing=autoFollow;
+    if(inside) {
         manualYRange=true;
-        hoverTimer->stop();
-        hideHover();
     }
     QCustomPlot::wheelEvent(event);
+    if(inside) lockedYRange=yAxis->range();
+    if(inside && wasFollowing) {
+        // Preserve the zoom level, but keep the newest point visible. Dragging
+        // still pauses range following for deliberate historical inspection.
+        followWindowSeconds=qBound(0.01,xAxis->range().size(),historySeconds);
+        fitLatest();
+        updateTargetLine();
+        replot(QCustomPlot::rpQueuedReplot);
+    }
 }
 void TracePlot::mouseDoubleClickEvent(QMouseEvent* event) {
     QCustomPlot::mouseDoubleClickEvent(event);
     if(event->button()==Qt::LeftButton && axisRect()->rect().contains(event->pos())) restoreView();
-}
-void TracePlot::leaveEvent(QEvent* event) {
-    hoverTimer->stop();
-    const bool wasHovering=hovering;
-    hideHover();
-    if(wasHovering) replot(QCustomPlot::rpQueuedReplot);
-    QCustomPlot::leaveEvent(event);
 }

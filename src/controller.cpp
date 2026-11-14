@@ -8,11 +8,11 @@
 #include <memory>
 
 void Settings::validate() const {
-    for (double v : {limitMA,nplc,manualMA})
+    for (double v : {limitMA,probeVoltageLimit,nplc,manualMA})
         if (!std::isfinite(v)) throw std::runtime_error("Parameters must be finite");
-    if (mode < 0 || mode > 2 || limitMA <= 0 || limitMA > 10
+    if (mode < 0 || mode > 2 || limitMA <= 0 || limitMA > 100
         || ((manual || currentTest) && std::abs(manualMA) > limitMA) || periodMs < 20 || periodMs > 2000
-        || nplc < 0.01 || nplc > 10)
+        || probeVoltageLimit < 0.1 || probeVoltageLimit > 15 || nplc < 0.01 || nplc > 10)
         throw std::runtime_error("Parameters outside supported range");
     if (overrideVoltageLimit && (!std::isfinite(voltageLimit) || voltageLimit < 0.1 || voltageLimit > 20))
         throw std::runtime_error("Override voltage limit must be within 0.1 to 20 V");
@@ -23,6 +23,8 @@ void Settings::validate() const {
         if (kp < 0 || ti < 0 || td < 0 || std::abs(direction) != 1)
             throw std::runtime_error("Invalid PID settings");
         if (std::abs(targetV) > 10) throw std::runtime_error("Target voltage must be within +/-10 V");
+        if (std::abs(targetV) > probeVoltageLimit)
+            throw std::runtime_error("Target voltage must not exceed the probe-voltage protection threshold");
     }
 }
 VoltagePid::VoltagePid(const Settings& settings) : s(settings) {
@@ -30,8 +32,8 @@ VoltagePid::VoltagePid(const Settings& settings) : s(settings) {
     PID_Init(&pid, s.kp, s.ti, s.td, s.periodMs/1000.0, -s.limitMA, s.limitMA);
 }
 void VoltagePid::setTargetVoltage(double volts) {
-    if (!std::isfinite(volts) || std::abs(volts)>10)
-        throw std::runtime_error("Target voltage must be finite and within +/-10 V");
+    if (!std::isfinite(volts) || std::abs(volts)>10 || std::abs(volts)>s.probeVoltageLimit)
+        throw std::runtime_error("Target voltage must be finite, within +/-10 V, and inside the probe-voltage protection threshold");
     s.targetV=volts;
 }
 double VoltagePid::step(double feedbackV, double seconds) {
@@ -69,7 +71,7 @@ void ControlThread::allowTargetUpdates(bool enabled) {
     targetPending=false;
 }
 bool ControlThread::requestTargetVoltage(double volts) {
-    if (!std::isfinite(volts) || std::abs(volts)>10) return false;
+    if (!std::isfinite(volts) || std::abs(volts)>10 || std::abs(volts)>settings.probeVoltageLimit) return false;
     QMutexLocker lock(&targetMutex);
     if (!acceptingTargets || shouldStop() || targetPending) return false;
     pendingTarget=volts;targetPending=true;
@@ -103,7 +105,7 @@ void ControlThread::runControl(Instrument& instrument) {
         allowTargetUpdates(false);
         const auto targetCleanup=qScopeGuard([this]{allowTargetUpdates(false);});
         settings.validate();
-        MeasurementProtection protection(settings.limitMA,settings.periodMs);
+        MeasurementProtection protection(settings.limitMA,settings.periodMs,settings.probeVoltageLimit);
         std::unique_ptr<VoltagePid> pid;
         if (!settings.currentTest) pid.reset(new VoltagePid(settings));
         if (settings.mode != 0) {
@@ -123,6 +125,13 @@ void ControlThread::runControl(Instrument& instrument) {
                          .arg(settings.manualMA, 0, 'f', 4));
         } else emit message(settings.mode == 0 ? "电压反馈仿真：1 mA 对应稳态 1 V，时间常数 0.8 s，正电流使探头电压增大。" :
                      settings.mode == 1 ? "IVI 驱动仿真：测量值由 SDK 模拟，不代表实际反馈响应" : "真实仪器已启动：CH1 探头电压与目标电压比较，PID 输出 CH2 电流。");
+        if(!settings.currentTest) {
+            QString protectionText=QString("探头电压软件保护阈值：±%1 V").arg(settings.probeVoltageLimit,0,'g',8);
+            if(settings.mode==2) protectionText+="；CH1 仪器硬件后备关断：±17 V（已读回核对）。";
+            else if(settings.mode==1) protectionText+="；±17 V 硬件后备值已由 IVI 驱动仿真读回，不代表真实关断动作。";
+            else protectionText+="；纯软件仿真未连接仪器。";
+            emit message(protectionText);
+        }
         QElapsedTimer& clock = sampleClock; clock.start();
         allowTargetUpdates(!settings.currentTest && !settings.manual);
         qint64 previousNs = 0;
@@ -279,7 +288,7 @@ void SessionThread::run() {
                 if(!settings.currentTest) {
                     instrument.checkMonitoring();
                     const double voltage=instrument.readVoltage();
-                    if(settings.mode!=1) MeasurementProtection(settings.limitMA,settings.periodMs).checkFeedback(voltage);
+                    if(settings.mode!=1) MeasurementProtection(settings.limitMA,settings.periodMs,settings.probeVoltageLimit).checkFeedback(voltage);
                     instrument.checkMonitoring(); // A measurement may have tripped CH1 protection.
                     const qint64 now=sampleClock.nsecsElapsed();
                     const double dt=previousMonitorNs<0 ? 0 : (now-previousMonitorNs)/1e6;

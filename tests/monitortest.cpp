@@ -49,8 +49,8 @@ public:
     }
     double readVoltage() override {
         if(!s.ch1) throw std::runtime_error("CH1 voltage read while relay open");
-        if(s.fault==1) return 10.001;
-        if(s.fault==2) return -10.001;
+        if(s.fault==1) return 15.001;
+        if(s.fault==2) return -15.001;
         if(s.fault==3) return std::numeric_limits<double>::quiet_NaN();
         if(s.fault==7) throw std::runtime_error("Injected acquisition I/O failure");
         if(!s.ch2) s.voltage=s.voltage.load()*.9; // Visible return after stopping, independent of setpoint.

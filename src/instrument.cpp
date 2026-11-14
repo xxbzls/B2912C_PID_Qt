@@ -5,6 +5,7 @@
 #include <limits>
 #include <stdexcept>
 
+static constexpr double probeHardwareBackstopV = 17.0;
 static void fail(const QString& text) { throw std::runtime_error(text.toUtf8().constData()); }
 Instrument::~Instrument() { shutdown(); }
 void Instrument::check(ViStatus status, const char* operation) {
@@ -186,6 +187,16 @@ void Instrument::configureMeasurement(int i, double nplc, bool measureCurrent) {
     for (int f = 0; f < (measureCurrent ? 2 : 1); ++f)
         check(MeasurementFunctionSetEnabled(session, meas[i].constData(), 1, &functions[f]), "Enable measurement function");
 }
+void Instrument::verifyProbeVoltageBackstop() {
+    double actual = 0;
+    check(GetAttributeViReal64(session,meas[0].constData(),KTB2900_ATTR_MEASUREMENT_VOLTAGE_COMPLIANCE_VALUE,&actual),
+          "CH1 probe-voltage hardware backstop readback");
+    if (!std::isfinite(actual) || std::abs(actual-probeHardwareBackstopV)>1e-6*probeHardwareBackstopV)
+        fail(QString("CH1 探头硬件后备关断读回为 %1 V，不是要求的 ±%2 V；拒绝开启输出。")
+             .arg(actual,0,'g',12).arg(probeHardwareBackstopV,0,'g',8));
+    if(log) log(QString("CH1 探头硬件后备关断：±%1 V（已设置并读回核对）。")
+                .arg(actual,0,'g',8));
+}
 void Instrument::prepareMonitoring(double nplc) {
     if (!session || !std::isfinite(nplc) || nplc < 0.01 || nplc > 10) fail("Invalid monitoring configuration");
     verifyControlOwnership();
@@ -218,7 +229,10 @@ void Instrument::prepareMonitoring(double nplc) {
     real(out[0], KTB2900_ATTR_OUTPUT_CURRENT_LEVEL, 0);
     boolean(out[0], KTB2900_ATTR_OUTPUT_CURRENT_AUTO_RANGE_ENABLED, false);
     real(out[0], KTB2900_ATTR_OUTPUT_CURRENT_RANGE, 1e-8);
-    real(meas[0], KTB2900_ATTR_MEASUREMENT_VOLTAGE_COMPLIANCE_VALUE, 12);
+    // Software protection is at most 15 V. The independent 17 V instrument
+    // backstop leaves 2 V of margin while remaining inside the 20 V range.
+    real(meas[0], KTB2900_ATTR_MEASUREMENT_VOLTAGE_COMPLIANCE_VALUE,probeHardwareBackstopV);
+    verifyProbeVoltageBackstop();
     boolean(meas[0], KTB2900_ATTR_MEASUREMENT_VOLTAGE_AUTO_RANGE_ENABLED, false);
     real(meas[0], KTB2900_ATTR_MEASUREMENT_VOLTAGE_RANGE, 20);
     configureMeasurement(0, nplc, false);
@@ -272,9 +286,12 @@ QStringList Instrument::stopControlOutput() {
 }
 void Instrument::configure(double voltageLimit, double nplc, bool currentTest, bool preserveVoltageLimit, double currentLimitMA) {
     if (!session || !std::isfinite(nplc) || nplc < 0.01 || nplc > 10) fail("Invalid instrument configuration");
-    if (!std::isfinite(currentLimitMA) || currentLimitMA <= 0 || currentLimitMA > 10) fail("Invalid current limit");
+    if (!std::isfinite(currentLimitMA) || currentLimitMA <= 0 || currentLimitMA > 100) fail("Invalid current limit");
     verifyControlOwnership();
     currentLimitAmps = currentLimitMA/1000.0;
+    // B2912C provides discrete source/measurement ranges. Retain the 10 mA
+    // range for the existing default and select 100 mA only when requested.
+    const double currentRangeAmps = currentLimitMA <= 10 ? 0.01 : 0.1;
     // Read BEFORE reset: the reset would otherwise discard the customer's setting.
     // B2912C uses one symmetric compliance value (the POS/NEG attributes target other models).
     if (preserveVoltageLimit) voltageLimit = outputVoltageLimit();
@@ -295,13 +312,19 @@ void Instrument::configure(double voltageLimit, double nplc, bool currentTest, b
         integer(out[i], KTB2900_ATTR_OUTPUT_TYPE, KTB2900_VAL_OUTPUT_TYPE_CURRENT);
         real(out[i], KTB2900_ATTR_OUTPUT_CURRENT_LEVEL, 0);
         boolean(out[i], KTB2900_ATTR_OUTPUT_CURRENT_AUTO_RANGE_ENABLED, false);
-        real(out[i], KTB2900_ATTR_OUTPUT_CURRENT_RANGE, i == 0 ? 1e-8 : 0.01);
-        real(meas[i], KTB2900_ATTR_MEASUREMENT_VOLTAGE_COMPLIANCE_VALUE, i == 0 ? 12.0 : voltageLimit);
+        real(out[i], KTB2900_ATTR_OUTPUT_CURRENT_RANGE, i == 0 ? 1e-8 : currentRangeAmps);
+        if(i==1) {
+            boolean(meas[i],KTB2900_ATTR_MEASUREMENT_CURRENT_AUTO_RANGE_ENABLED,false);
+            real(meas[i],KTB2900_ATTR_MEASUREMENT_CURRENT_RANGE,currentRangeAmps);
+        }
+        real(meas[i], KTB2900_ATTR_MEASUREMENT_VOLTAGE_COMPLIANCE_VALUE,
+             i == 0 ? probeHardwareBackstopV : voltageLimit);
         const bool autoVoltageRange = i == 1 && voltageLimit > 20;
         boolean(meas[i], KTB2900_ATTR_MEASUREMENT_VOLTAGE_AUTO_RANGE_ENABLED, autoVoltageRange);
         if (!autoVoltageRange) real(meas[i], KTB2900_ATTR_MEASUREMENT_VOLTAGE_RANGE, 20);
         configureMeasurement(i, nplc, i == 1);
     }
+    if(!currentTestOnly) verifyProbeVoltageBackstop();
     const double actualLimit = outputVoltageLimit();
     if (std::abs(actualLimit-voltageLimit) > 1e-6 * std::max(1.0,voltageLimit))
         fail("CH2 电压上限读回与配置不一致；尚未开启输出。");
@@ -313,6 +336,8 @@ void Instrument::configure(double voltageLimit, double nplc, bool currentTest, b
     if (log) log("保护配置已读回：仪器到限关断已开启，测量自动开启输出已关闭。");
     if (log) log(QString("CH2 电压上限：±%1 V（%2）；电流由 PID 或手动设定，继续受电流限幅约束。")
         .arg(actualLimit,0,'g',8).arg(preserveVoltageLimit ? "保留仪器原值，复位后已恢复并核对" : "高级设置覆盖，已读回核对"));
+    if (log) log(QString("CH2 电流量程：±%1 mA；本次软件限幅：±%2 mA。")
+        .arg(currentRangeAmps*1000,0,'g',8).arg(currentLimitMA,0,'g',8));
 }
 void Instrument::enable() {
     if (!configured || !runConfigured) fail("Instrument not configured for control output");

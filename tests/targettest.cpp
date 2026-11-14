@@ -50,7 +50,7 @@ public:
         while(remaining>0 && !s.slowReads.compare_exchange_weak(remaining,remaining-1)) {}
         if(remaining>0) QThread::msleep(static_cast<unsigned long>(s.slowReadMs.load()));
         s.inRead=false;
-        return s.fault==1 ? 10.1 : s.amps*1000;
+        return s.fault==1 ? 15.1 : s.amps*1000;
     }
     double readCurrent() override {return s.fault==2 ? 0.02 : s.amps;}
     double readOutputVoltage() override {return s.amps*1000;}

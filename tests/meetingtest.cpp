@@ -191,12 +191,19 @@ int meetingTest() {
         auto* defaultKp=window.findChild<QDoubleSpinBox*>("proportionalGain");
         auto* defaultTi=window.findChild<QDoubleSpinBox*>("integralTime");
         auto* defaultNplc=window.findChild<QDoubleSpinBox*>("measurementNplc");
+        auto* defaultProbeLimit=window.findChild<QDoubleSpinBox*>("probeVoltageProtection");
+        auto* currentLimit=window.findChild<QDoubleSpinBox*>("currentLimit");
+        auto* manualCurrent=window.findChild<QDoubleSpinBox*>("manualCurrent");
         QStringList frequencyLabels;for(int i=0;i<frequency->count();++i)frequencyLabels<<frequency->itemText(i);
         require(saveData->isChecked() && !frequency->isEditable() && frequency->currentData().toInt()==1
             && defaultKp && defaultTi && std::abs(defaultKp->value()-.8)<1e-12 && std::abs(defaultTi->value()-5.2)<1e-12
             && defaultNplc && std::abs(defaultNplc->value()-1.0)<1e-12
+            && defaultProbeLimit && std::abs(defaultProbeLimit->value()-15.0)<1e-12
+            && std::abs(defaultProbeLimit->minimum()-.1)<1e-12 && std::abs(defaultProbeLimit->maximum()-15.0)<1e-12
+            && currentLimit && std::abs(currentLimit->value()-10.0)<1e-12 && std::abs(currentLimit->maximum()-100.0)<1e-12
+            && manualCurrent && std::abs(manualCurrent->minimum()+100.0)<1e-12 && std::abs(manualCurrent->maximum()-100.0)<1e-12
             && frequencyLabels==QStringList({"1 Hz","10 Hz"}),
-            "Defaults are enabled 1 Hz storage, Kp 0.8 mA/V, Ti 5.2 s and 1.0 NPLC");
+            "Defaults include 10 mA current limit with configurable +/-100 mA endpoints and +/-15 V probe protection");
         frequency->setCurrentIndex(frequency->findData(10));
         auto* target=window.findChild<QDoubleSpinBox*>("targetVoltage");target->setValue(4);
         defaultKp->setValue(.2);defaultTi->setValue(.1);defaultNplc->setValue(.1);

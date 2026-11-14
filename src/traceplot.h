@@ -3,7 +3,6 @@
 #include "secondaverage.h"
 #include <deque>
 #include <limits>
-class QLabel;
 class QTimer;
 
 class TracePlot : public QCustomPlot {
@@ -23,16 +22,18 @@ protected:
     void mouseMoveEvent(QMouseEvent* event) override;
     void wheelEvent(QWheelEvent* event) override;
     void mouseDoubleClickEvent(QMouseEvent* event) override;
-    void leaveEvent(QEvent* event) override;
 private:
     double targetValue = 2;
     QMap<double,double> targetHistory;
     QSharedPointer<QCPGraphDataContainer> liveData[2];
-    QMap<double,double> pausedTargetHistory;
-    double pausedTargetValue = 2;
     bool autoFollow = true;
     bool manualYRange = false;
-    bool hovering = false;
+    // Exact user-selected Y range. New samples may advance X, but must never
+    // replace this range until the user explicitly restores the full view.
+    QCPRange lockedYRange;
+    // Zero means show the complete retained history. A positive value keeps
+    // the user-selected wheel-zoom span while the right edge follows new data.
+    double followWindowSeconds = 0;
     bool currentMode = false;
     static constexpr double historySeconds = 24 * 60 * 60;
     SecondAverage<2> averaging;
@@ -40,22 +41,12 @@ private:
     // Monotonic queues keep full-history autoscaling O(1) per sample.
     std::deque<QPair<double,double>> minimums, maximums;
     QTimer* redrawTimer;
-    QTimer* hoverTimer;
-    QPoint hoverPixel;
     QPoint dragStartPixel;
-    bool dragCandidate = false;
-    double hoverKey = std::numeric_limits<double>::quiet_NaN();
-    QLabel* hoverLabel;
-    QCPItemTracer* marker;
-    QCPItemStraightLine* cursorLine;
+    bool dragCandidate = false, dragInProgress = false;
     void fitLatest();
-    void pauseView();
     void accumulateSample(double seconds, double value, double measured = 0);
     void finishSample(double seconds, double lower, double upper);
     double targetAt(double seconds) const;
     double displayedTargetAt(double seconds) const;
     void updateTargetLine();
-    void scheduleHover(QPoint pixel);
-    void updateHover(QPoint pixel);
-    void hideHover();
 };

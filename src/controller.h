@@ -13,7 +13,7 @@ struct Settings {
     int mode = 0; // 0: plant, 1: IVI simulation, 2: real instrument
     QString resource;
     double targetV = 0, kp = 0.8, ti = 5.2, td = 0; // target: V; Kp: mA/V; Ti/Td: s
-    double limitMA = 10, voltageLimit = 5, nplc = 1.0, manualMA = 0;
+    double limitMA = 10, probeVoltageLimit = 15, voltageLimit = 5, nplc = 1.0, manualMA = 0;
     bool overrideVoltageLimit = false; // Default: preserve CH2 compliance set on the instrument.
     int direction = 1, periodMs = 100;
     bool manual = false;

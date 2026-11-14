@@ -55,6 +55,7 @@ private:
     void check(ViStatus status, const char* operation);
     void resetForRun();
     void configureMeasurement(int index, double nplc, bool measureCurrent);
+    void verifyProbeVoltageBackstop();
     void verifyIndependentChannels();
     void prepareIndependentChannels();
     void writeScpi(const QByteArray& command);
