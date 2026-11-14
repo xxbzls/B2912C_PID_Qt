@@ -10,6 +10,8 @@ namespace {
 QByteArray reply;
 QStringList operations;
 bool shortWrite=false, readFailure=false, writeFailure=false, waitFailure=false, clearFailure=false;
+bool errorQueryFailure=false;
+QList<ViInt32> recoveryErrors;
 ViInt64 reportedSize=-1;
 ViStatus _VI_FUNC writeBytes(ViSession, ViInt64 size, ViByte bytes[], ViInt64* count) {
     operations << QString::fromLatin1(reinterpret_cast<char*>(bytes), static_cast<int>(size));
@@ -30,9 +32,19 @@ ViStatus _VI_FUNC clearIo(ViSession) {
     operations << "clear";
     return clearFailure ? KTB2900_ERROR_IO_GENERAL : VI_SUCCESS;
 }
+ViStatus _VI_FUNC queryError(ViSession,ViInt32* code,ViChar message[]) {
+    operations << "error?";
+    if(errorQueryFailure)return KTB2900_ERROR_IO_GENERAL;
+    *code=recoveryErrors.isEmpty() ? 0 : recoveryErrors.takeFirst();
+    const QByteArray text=*code==0 ? QByteArray("No error") :
+        *code==-241 ? QByteArray("Hardware missing") : QByteArray("Query boundary error");
+    std::strcpy(message,text.constData());
+    return VI_SUCCESS;
+}
 class ShutdownAudit final : public Instrument {
 public:
     bool outputEnabled(int channel) override {operations<<QString("read%1").arg(channel);return false;}
+    void checkCompliance() override {operations<<"compliance";}
 protected:
     void disableOutput(int channel) override {operations<<QString("off%1").arg(channel);}
 };
@@ -48,6 +60,7 @@ int groupTest() {
     instrument.SystemReadBytes=readBytes;
     instrument.SystemWaitForOperationComplete=waitComplete;
     instrument.SystemClearIO=clearIo;
+    instrument.error_query=queryError;
     const auto cleanup=qScopeGuard([&]{instrument.session=VI_NULL;});
     auto require=[&](bool ok,const QString& text) {
         if(!ok) throw std::runtime_error(text.toStdString());
@@ -105,6 +118,26 @@ int groupTest() {
             && operations==QStringList{"clear","off2","off1","read2","read1"},
             "Failed recovery is reported but still attempts every output OFF and verification");
         instrument.rawQueryPending=false;instrument.configured=false;clearFailure=false;
+        instrument.simulated=true;
+        recoveryErrors={-410,-420,-430,-440,0};operations.clear();
+        instrument.recoverCommunication();
+        require(operations==QStringList{"clear","error?","error?","error?","error?","error?","compliance"}
+            && !instrument.rawQueryPending,
+            "Recovery Device Clear drains stale query-boundary errors before checking output state");
+        recoveryErrors={-241,0};operations.clear();
+        require(rejects([&]{instrument.recoverCommunication();})
+            && operations==QStringList{"clear","error?"},
+            "Recovery never ignores a non-query-boundary instrument error");
+        recoveryErrors={0};errorQueryFailure=true;operations.clear();instrument.rawQueryPending=false;
+        require(rejects([&]{instrument.recoverCommunication();}) && instrument.rawQueryPending
+            && operations==QStringList{"clear","error?"},
+            "Error-queue I/O failure keeps the transaction marked incomplete for the next Device Clear");
+        errorQueryFailure=false;instrument.rawQueryPending=false;
+        clearFailure=true;operations.clear();
+        require(rejects([&]{instrument.recoverCommunication();}) && instrument.rawQueryPending
+            && operations==QStringList{"clear"},
+            "Failed recovery Device Clear keeps the transaction marked incomplete for shutdown");
+        clearFailure=false;instrument.rawQueryPending=false;
         results << "LIMIT: Raw transport injected; see group_driver_probe.py for installed-driver loopback verification.";
     } catch(const std::exception& e) {results<<"FAIL "+QString::fromUtf8(e.what());result=1;}
     const QString output=qEnvironmentVariable("TEST_OUTPUT_DIR",QDir::currentPath());QDir().mkpath(output);

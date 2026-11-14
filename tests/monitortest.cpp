@@ -20,6 +20,7 @@ void waitUntil(const std::function<bool()>& done, int timeout=6000) {
 struct State {
     std::atomic_bool ch1{false},ch2{false},closed{false};
     std::atomic_int prepared{0},configured{0},enabled{0},commands{0},currentReads{0},fault{0};
+    std::atomic_int recoveries{0},reconnects{0};
     std::atomic<double> amps{-.001},voltage{2};
 };
 class Transport final : public Instrument {
@@ -46,6 +47,15 @@ public:
     void checkCompliance() override {
         verifyControlOwnership();
         if(!s.ch1 || !s.ch2) throw std::runtime_error("Control output disabled");
+    }
+    void verifyOutputProtection() override {}
+    void recoverCommunication() override {
+        ++s.recoveries;
+        if(s.fault==7) throw std::runtime_error("Injected recovery I/O error");
+        checkMonitoring();
+    }
+    QString reconnect(const QString&) override {
+        ++s.reconnects;s.fault=0;return "B2912C MONITOR RECONNECTED TEST";
     }
     double readVoltage() override {
         if(!s.ch1) throw std::runtime_error("CH1 voltage read while relay open");
@@ -134,6 +144,7 @@ int monitorTest() {
             require(state.closed && !state.ch1 && !state.ch2 && errors.isEmpty(),"Disconnect closes both channels and ends monitoring");
         }
         for(int fault=1;fault<=8;++fault) {
+            if(fault==7) continue; // Transport failure has a dedicated auto-reconnect test below.
             State state;MonitorSession session(settings,state);QObject receiver;int idle=0,running=0,stopped=0;QStringList errors;
             QObject::connect(&session,&ControlThread::monitorSample,&receiver,[&]{++idle;});
             QObject::connect(&session,&ControlThread::sample,&receiver,[&]{++running;});
@@ -145,6 +156,17 @@ int monitorTest() {
             waitUntil([&]{return !session.isRunning();});session.wait();QCoreApplication::processEvents();
             require(!errors.isEmpty() && state.closed && !state.ch1 && !state.ch2 && state.prepared==1 && stopped==0
                 && !session.startControl(settings),QString("Fault %1 closes both channels, reports failure and never resumes monitoring or control automatically").arg(fault));
+        }
+        {
+            State state;MonitorSession session(settings,state);QObject receiver;int idle=0;QStringList errors;
+            QObject::connect(&session,&ControlThread::monitorSample,&receiver,[&]{++idle;});
+            QObject::connect(&session,&ControlThread::failed,&receiver,[&](QString e){errors<<e;});
+            session.start();waitUntil([&]{return idle>=2;});const int before=idle;state.fault=7;
+            waitUntil([&]{return idle>=before+2;},12000);
+            require(session.isRunning() && errors.isEmpty() && state.recoveries==4 && state.reconnects==1,
+                    "Idle monitoring rebuilds the session after three failed in-session communication recoveries");
+            session.disconnectDevice();session.wait();
+            require(state.closed && !state.ch1 && !state.ch2,"Recovered monitoring session still obeys explicit disconnect");
         }
 
         // Explicit IVI simulation only: exercise actual driver selectors and production output sequencing.

@@ -6,6 +6,7 @@
 #include <QElapsedTimer>
 #include <atomic>
 #include <memory>
+#include <functional>
 #include "PIDFunction.h"
 #include "datarecorder.h"
 
@@ -68,6 +69,8 @@ protected:
     std::atomic_bool stopRequested{false};
     Settings settings;
     QElapsedTimer sampleClock;
+    bool recoverInstrument(class Instrument& instrument, const QString& initialError,
+                           const std::function<void()>& verifyState);
 private:
     QMutex targetMutex;
     bool acceptingTargets = false, targetPending = false;

@@ -13,11 +13,12 @@
 #include <stdexcept>
 
 namespace {
-enum class Fault { None, HighFeedback, LowFeedback, Overcurrent, Undercurrent, HardwareOff, LockLost };
+enum class Fault { None, HighFeedback, LowFeedback, Overcurrent, Undercurrent, HardwareOff, LockLost, Communication };
 struct FakeState {
     Fault fault = Fault::None;
     bool on[2] = {}, closed = false, currentOnly = false;
     int enables = 0, measurements = 0, configurations = 0;
+    int communicationFailures = 0, recoveries = 0, reconnectAttempts = 0;
     double amps = 0;
     QList<double> commands;
 };
@@ -41,6 +42,8 @@ public:
     }
     QStringList stopControlOutput() override {s.on[1]=false;return {};}
     double readVoltage() override {
+        if(s.fault==Fault::Communication && s.communicationFailures++==0)
+            throw std::runtime_error("Injected I/O error during feedback acquisition");
         return s.fault==Fault::HighFeedback ? 15.0001 : s.fault==Fault::LowFeedback ? -15.0001 : 0;
     }
     double readCurrent() override {
@@ -54,9 +57,22 @@ public:
     double outputVoltageLimit() override {return 2;}
     bool outputEnabled(int channel) override {return s.on[channel-1];}
     void setCurrent(double amps) override {s.amps=amps;s.commands<<amps;}
+    double currentSetting() override {return s.amps;}
     void checkCompliance() override {if(!s.on[1]) throw std::runtime_error("Injected hardware output trip");}
+    void verifyOutputProtection() override {}
     void verifyControlOwnership() override {
         if(s.fault==Fault::LockLost) throw std::runtime_error("Injected lost device lock");
+    }
+    void recoverCommunication() override {
+        ++s.recoveries;
+        if(s.fault==Fault::Communication) throw std::runtime_error("Injected recovery I/O error");
+        checkCompliance();
+    }
+    QString reconnect(const QString&) override {
+        ++s.reconnectAttempts;
+        if(s.reconnectAttempts==1) throw std::runtime_error("Injected new-session open failure");
+        s.fault=Fault::None;
+        return "B2912C RECONNECTED TEST DOUBLE";
     }
     QStringList stopOutputs() override {s.on[0]=s.on[1]=false;return {};}
     QStringList shutdown() override {auto errors=stopOutputs();s.closed=true;return errors;}
@@ -196,6 +212,22 @@ int protectionTest() {
                 if(scenario==Fault::None)
                     require(samples>=5,"Normal continuous output continues until user stop");
             }
+        }
+        {
+            Settings settings;settings.mode=2;settings.resource="FAKE-RECONNECT-NO-HARDWARE";
+            settings.manual=true;settings.manualMA=1;settings.limitMA=1;settings.periodMs=20;
+            FakeState state;state.fault=Fault::Communication;FaultWorker worker(settings,state);
+            QString failure;int samples=0;
+            QObject::connect(&worker,&ControlThread::failed,[&](QString text){failure=text;});
+            QObject::connect(&worker,&ControlThread::sample,[&](double,double,double,double,double){
+                if(++samples>=3) worker.requestStop();
+            });
+            worker.start();
+            if(!worker.wait(12000)){worker.requestStop();worker.wait();throw std::runtime_error("Reconnect worker did not stop");}
+            require(failure.isEmpty() && state.recoveries==4 && state.reconnectAttempts==2,
+                    "Three failed in-session recoveries fall back to repeated automatic session reconnect");
+            require(samples>=3 && state.commands.size()>=3 && state.closed,
+                    "Closed-loop output resumes after reconnect state verification and stops only on user request");
         }
         {
             Settings settings;settings.mode=2;settings.resource="FAKE-NO-HARDWARE";

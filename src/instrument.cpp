@@ -67,6 +67,14 @@ QString Instrument::open(const QString& resource, bool simulation, bool resetOnO
     // Never reset until exclusive control has been obtained.
     check(InitWithOptions(address.data(), VI_TRUE, VI_FALSE, options, &session), "InitWithOptions");
     sdkDiagnostic("SESSION_OPEN resource="+resource+" simulated="+QString::number(simulation));
+    if(!simulation && !lockedSerial.isEmpty()) {
+        // The instrument error queue outlives a failed SDK session. Clear the
+        // new transport boundary and remove only stale query-boundary errors
+        // before any identity/property query can surface the old -420 again.
+        check(SystemClearIO(session),"Clear newly reconnected session");
+        rawQueryPending=false;
+        drainRecoveryErrors();
+    }
     if(!simulation) {
         const QByteArray tracePath=QDir::toNativeSeparators(QCoreApplication::applicationDirPath()+
             "/Diagnostics/driver_"+QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss_zzz")+".log").toLocal8Bit();
@@ -99,7 +107,14 @@ QString Instrument::open(const QString& resource, bool simulation, bool resetOnO
         const QString serialNumber = QString::fromLatin1(serial).trimmed();
         if (serialNumber.isEmpty()) fail("无法识别仪器序列号，拒绝取得控制权。");
         // Serial number unifies VISA aliases, hostnames, HiSLIP, VXI-11 and USB addresses.
-        deviceLock.acquire("instrument:" + serialNumber.toUpper());
+        const QString normalizedSerial=serialNumber.toUpper();
+        if(lockedSerial.isEmpty()) {
+            deviceLock.acquire("instrument:" + normalizedSerial);
+            lockedSerial=normalizedSerial;
+        } else if(lockedSerial!=normalizedSerial) {
+            fail(QString("自动重连识别到不同仪器（原序列号 %1，新序列号 %2），拒绝继续输出。")
+                 .arg(lockedSerial,normalizedSerial));
+        }
         char owner[256] = {}, name[256] = {};
         check(SystemLockOwner(session,sizeof(owner),owner),"Read interface lock owner");
         const QString currentOwner = QString::fromLatin1(owner).trimmed().remove('"');
@@ -276,7 +291,8 @@ void Instrument::checkMonitoring() {
 }
 QStringList Instrument::stopControlOutput() {
     QStringList errors;
-    if (!session || !configured) return errors;
+    if (!configured) return errors;
+    if (!session) return {"SDK 会话当前不可用，无法发送或确认 CH2 关断；请恢复仪器通信或在面板手动关断。"};
     // CH2 OFF is the first operation. Never write 0 mA, ramp, or re-enable CH1 here.
     try { disableOutput(2); } catch (const std::exception& e) { errors << QString::fromUtf8(e.what()); }
     try { if (outputEnabled(2)) fail("CH2 output still enabled"); }
@@ -464,12 +480,63 @@ void Instrument::verifyControlOwnership() {
     if (QString::fromLatin1(owner).trimmed().remove('"') != interfaceName)
         fail("仪器控制锁已丢失，停止运行并尝试关断输出。");
 }
+void Instrument::drainRecoveryErrors() {
+    // Device Clear restores the transport boundary, but the instrument error
+    // queue may still contain the query error caused by the interrupted
+    // transaction. With QueryInstrStatus enabled, the next unrelated driver
+    // call would surface that stale -410/-420/-430/-440 and abort recovery.
+    for(int index=0;index<16;++index) {
+        ViInt32 code=0;char message[2048]={};
+        rawQueryPending=true;
+        const ViStatus status=error_query(session,&code,message);
+        if(status<0) check(status,"Drain instrument errors after Device Clear");
+        rawQueryPending=false;
+        if(status>0 && log) log(QString("SDK warning Drain instrument errors after Device Clear: %1").arg(status));
+        if(code==0) return;
+        const QString text=QString::fromLocal8Bit(message).trimmed();
+        sdkDiagnostic(QString("RECOVERY_ERROR_QUEUE code=%1 message=%2").arg(code).arg(text));
+        if(code==-410 || code==-420 || code==-430 || code==-440) {
+            if(log) log(QString("通信恢复已清除查询边界错误 %1：%2").arg(code).arg(text));
+            continue;
+        }
+        fail(QString("通信恢复发现非查询边界仪器错误 %1：%2；为避免掩盖真实故障，将停止并关断。")
+             .arg(code).arg(text));
+    }
+    fail("通信恢复时仪器错误队列超过16项且未清空；将停止并关断。");
+}
 void Instrument::recoverCommunication() {
-    check(SystemClearIO(session),"Recover communication boundary");
+    try {check(SystemClearIO(session),"Recover communication boundary");}
+    catch(...) {rawQueryPending=true;throw;}
     rawQueryPending=false;
+    drainRecoveryErrors();
     verifyControlOwnership();
     verifyIndependentChannels();
-    checkCompliance();
+    if(monitoringSession && !runConfigured) checkMonitoring();
+    else checkCompliance();
+}
+QString Instrument::reconnect(const QString& resource) {
+    if(simulated || lockedSerial.isEmpty()) fail("自动重连要求仍持有原仪器的本机控制锁。");
+    const ViSession staleSession=session;
+    session=VI_NULL;
+    interfaceLocked=false;
+    rawQueryPending=false;
+    if(staleSession && close) {
+        const ViStatus closeStatus=close(staleSession);
+        sdkDiagnostic(QString("RECONNECT_CLOSE_STALE status=%1").arg(closeStatus));
+        if(closeStatus<0 && log) log(QString("旧 SDK 会话关闭返回 %1；继续尝试建立新会话。").arg(closeStatus));
+    }
+    try {
+        const QString identity=open(resource,false,false);
+        sdkDiagnostic("RECONNECT_SESSION_OPENED identity="+identity);
+        return identity;
+    } catch(...) {
+        const ViSession failedSession=session;
+        session=VI_NULL;
+        interfaceLocked=false;
+        rawQueryPending=false;
+        if(failedSession && close) close(failedSession);
+        throw;
+    }
 }
 void Instrument::resetForRun() {
     if (!session) fail("Connect the instrument before starting output");
@@ -478,7 +545,10 @@ void Instrument::resetForRun() {
 }
 QStringList Instrument::stopOutputs() {
     QStringList errors;
-    if (!session) return errors;
+    if (!session) {
+        if(configured) errors << "SDK 会话当前不可用，无法发送或确认 CH2、CH1 关断；请在仪器面板检查。";
+        return errors;
+    }
     auto attempt = [&](const std::function<void()>& fn) { try { fn(); } catch(const std::exception& e) { errors << QString::fromUtf8(e.what()); } };
     if (configured) {
         // A timed-out query may leave a response in the transport. Device Clear
@@ -508,7 +578,7 @@ void Instrument::disableOutput(int channel) {
 }
 QStringList Instrument::shutdown() {
     QStringList errors=stopOutputs();
-    if (!session) { deviceLock.release(); return errors; }
+    if (!session) { deviceLock.release(); lockedSerial.clear(); return errors; }
     if (interfaceLocked) {
         try { check(SystemReleaseLock(session),"Release instrument interface lock"); }
         catch(const std::exception& e) { errors << QString::fromUtf8(e.what()); }
@@ -517,6 +587,6 @@ QStringList Instrument::shutdown() {
     try { check(close(session), "Close"); }
     catch(const std::exception& e) { errors << QString::fromUtf8(e.what()); }
     session = VI_NULL; configured = false; runConfigured = false; monitoringSession = false; rawQueryPending = false;
-    deviceLock.release();
+    deviceLock.release(); lockedSerial.clear();
     return errors;
 }

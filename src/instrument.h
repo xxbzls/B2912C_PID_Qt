@@ -30,11 +30,14 @@ public:
     virtual QStringList stopOutputs();
     virtual void setCurrent(double amps);
     virtual void checkCompliance();
-    void verifyOutputProtection();
+    virtual void verifyOutputProtection();
     virtual void verifyControlOwnership();
     virtual void recoverCommunication();
+    // Rebuild only the SDK/VISA session. The instrument is not reset and its
+    // established output/configuration state must be verified by the caller.
+    virtual QString reconnect(const QString& resource);
     virtual QStringList shutdown(); // Attempt every shutdown step even if a previous step fails.
-    double currentSetting();
+    virtual double currentSetting();
 protected:
     virtual void disableOutput(int channel);
 private:
@@ -49,13 +52,14 @@ private:
     bool rawQueryPending = false;
     QElapsedTimer diagnosticTimer;
     double currentLimitAmps = 0.01;
-    QString interfaceName;
+    QString interfaceName, lockedSerial;
     ProcessLock deviceLock;
     QByteArray out[2], meas[2];
     void check(ViStatus status, const char* operation);
     void resetForRun();
     void configureMeasurement(int index, double nplc, bool measureCurrent);
     void verifyProbeVoltageBackstop();
+    void drainRecoveryErrors();
     void verifyIndependentChannels();
     void prepareIndependentChannels();
     void writeScpi(const QByteArray& command);
