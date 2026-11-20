@@ -72,14 +72,19 @@ void Window::buildUi() {
     applyTargetButton->setToolTip("PID 运行中应用新目标，保持输出开启和积分状态；继续执行现有保护。");
     targetRow->addWidget(target,1);targetRow->addWidget(applyTargetButton);field("目标电压（V）",targetCell,0,0,2);
     kp=spin(Settings{}.kp,0,1e4);kp->setObjectName("proportionalGain");kp->setToolTip("比例增益：每 1 V 电压误差对应多少 mA 控制电流。");field("Kp（mA/V）",kp,1,0);
-    limit=spin(10,.001,10);limit->setToolTip("客户允许范围为 -10～+10 mA；测试时可设更小限幅。");field("电流限幅（±mA）",limit,1,1);
+    limit=spin(Settings{}.limitMA,.001,100);limit->setObjectName("currentLimit");
+    limit->setToolTip("可设置 0.001～100 mA；默认仍为 ±10 mA。\n限幅不超过10 mA时使用10 mA量程，超过10 mA时切换100 mA量程。\n提高限幅前请确认负载、接线和CH2电压上限能够安全承受相应功率。");
+    limit->setToolTipDuration(20000);field("电流限幅（±mA）",limit,1,1);
     ti=spin(Settings{}.ti,0,1e4);ti->setObjectName("integralTime");td=spin(0,0,100);field("Ti（s，0 关闭积分）",ti,2,0);field("Td（s）",td,2,1);
-    manual=spin(0,-10,10);manual->setObjectName("manualCurrent");field("手动电流（mA）",manual,3,0);
+    manual=spin(0,-100,100);manual->setObjectName("manualCurrent");field("手动电流（mA）",manual,3,0);
+    probeVoltageLimit=spin(Settings{}.probeVoltageLimit,.1,15);probeVoltageLimit->setObjectName("probeVoltageProtection");
+    probeVoltageLimit->setSuffix(" V");probeVoltageLimit->setToolTip("CH1 探头电压的双极性软件关断阈值。\n绝对值超过此值时立即停止控制并关断两个通道；默认 ±15 V，可设置 0.1～15 V。\n运行中锁定；连接前修改也用于空闲探头监测，连接后修改会在下一次启动输出时生效。仪器 CH1 另有 ±17 V 硬件后备关断。");
+    probeVoltageLimit->setToolTipDuration(20000);field("探头保护阈值（±V）",probeVoltageLimit,3,1);
     direction=new QComboBox;direction->addItems({"+1 正电流使探头电压增大","-1 正电流使探头电压减小"});field("控制方向",direction,4,0,2);
     voltageLimitStatus=new QLabel;voltageLimitStatus->setObjectName("voltageLimitStatus");voltageLimitStatus->setWordWrap(true);
-    field("CH2 电压上限",voltageLimitStatus,3,1);
+    field("CH2 电压上限",voltageLimitStatus,5,0,2);
     auto* advancedToggle=new QToolButton;advancedToggle->setText("高级设置");advancedToggle->setCheckable(true);advancedToggle->setObjectName("advancedInstrumentToggle");
-    advancedToggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);advancedToggle->setArrowType(Qt::RightArrow);grid->addWidget(advancedToggle,5,0,1,2,Qt::AlignLeft);
+    advancedToggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);advancedToggle->setArrowType(Qt::RightArrow);grid->addWidget(advancedToggle,6,0,1,2,Qt::AlignLeft);
     auto* advanced=new QWidget;auto* advancedLayout=new QVBoxLayout(advanced);advancedLayout->setContentsMargins(0,0,0,0);advancedLayout->setSpacing(6);
     auto* samplingLayout=new QGridLayout;samplingLayout->setHorizontalSpacing(10);samplingLayout->setVerticalSpacing(4);
     samplingLayout->setColumnStretch(0,1);samplingLayout->setColumnStretch(1,1);
@@ -95,7 +100,7 @@ void Window::buildUi() {
     voltageLimit=spin(5,.1,20);voltageLimit->setObjectName("voltageLimitOverride");voltageLimit->setSuffix(" V");voltageLimit->setEnabled(false);
     voltageLimit->setToolTip("仅勾选覆盖时生效；取消勾选则读取并保留仪器当前上限。");advancedLayout->addWidget(voltageLimit);
     auto* advancedHint=muted("默认保留仪器原值，需要调整时才勾选覆盖。");advancedHint->setWordWrap(true);advancedLayout->addWidget(advancedHint);
-    grid->addWidget(advanced,6,0,1,2);advanced->hide();grid->setRowStretch(7,1);
+    grid->addWidget(advanced,7,0,1,2);advanced->hide();grid->setRowStretch(8,1);
     connect(advancedToggle,&QToolButton::toggled,this,[scroll,advanced,advancedToggle](bool visible){
         advanced->setVisible(visible);advancedToggle->setArrowType(visible ? Qt::DownArrow : Qt::RightArrow);
         if(visible) QTimer::singleShot(0,scroll,[scroll,advanced]{scroll->ensureWidgetVisible(advanced,0,8);});
@@ -122,8 +127,8 @@ void Window::buildUi() {
     auto* monitorTabs=new QTabWidget;monitorTabs->setObjectName("monitorTabs");monitorTabs->setDocumentMode(true);
     auto* plotsPanel=new QWidget;plotsPanel->setObjectName("curvesPage");auto* plotsLayout=new QVBoxLayout(plotsPanel);plotsLayout->setContentsMargins(8,4,8,6);plotsLayout->setSpacing(2);
     auto* plotTools=new QHBoxLayout;plotTools->setSpacing(10);
-    auto* plotHint=muted("整秒平均（1秒/点）  ·  保留最近24小时  ·  拖动/滚轮后暂停  ·  双击恢复动态显示");
-    plotHint->setToolTip("拖动或滚轮缩放后，当前画面停止自动刷新，后台继续采集并保留曲线数据；双击图像区域后显示全部保留数据并恢复动态更新。曲线按采集时间的整秒窗口取平均，无数据的秒不补点；1 Hz文件与控制期间的曲线均值对齐。");
+    auto* plotHint=muted("整秒平均（1秒/点）  ·  保留最近24小时  ·  滚轮缩放仍跟随最新  ·  双击恢复完整视图");
+    plotHint->setToolTip("滚轮缩放后保持新的时间跨度并继续显示最新数据；拖动查看历史时仅固定坐标范围，曲线数据仍持续追加和重绘。双击图像区域恢复完整历史视图与自动跟随。曲线按采集时间的整秒窗口取平均，无数据的秒不补点；1 Hz文件与控制期间的曲线均值对齐。");
     plotTools->addWidget(plotHint,1);
     auto* clearCurveButton=new QPushButton("清除曲线");clearCurveButton->setObjectName("clearCurveButton");
     clearCurveButton->setToolTip("清除历史采样曲线，保留目标参考线；运行中的采样和输出继续进行。");plotTools->addWidget(clearCurveButton);plotsLayout->addLayout(plotTools);

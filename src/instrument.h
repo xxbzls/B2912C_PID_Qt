@@ -30,11 +30,14 @@ public:
     virtual QStringList stopOutputs();
     virtual void setCurrent(double amps);
     virtual void checkCompliance();
-    void verifyOutputProtection();
+    virtual void verifyOutputProtection();
     virtual void verifyControlOwnership();
     virtual void recoverCommunication();
+    // Rebuild only the SDK/VISA session. The instrument is not reset and its
+    // established output/configuration state must be verified by the caller.
+    virtual QString reconnect(const QString& resource);
     virtual QStringList shutdown(); // Attempt every shutdown step even if a previous step fails.
-    double currentSetting();
+    virtual double currentSetting();
 protected:
     virtual void disableOutput(int channel);
 private:
@@ -48,13 +51,23 @@ private:
     bool simulated = false, interfaceLocked = false;
     bool rawQueryPending = false;
     QElapsedTimer diagnosticTimer;
+    // Slow-changing state (lock owner, grouping, compliance flags, error queue)
+    // is verified at most once per interval to keep USB traffic low; the
+    // hardware protection register is still read on every call.
+    static constexpr qint64 fullCheckIntervalMs = 1000;
+    QElapsedTimer ownershipTimer, fullCheckTimer;
+    bool fullCheckDue() const;
+    void pollInstrumentErrors(bool strict = false);
+    bool handleInstrumentError(ViInt32 code, const QString& text, bool duringRecovery);
     double currentLimitAmps = 0.01;
-    QString interfaceName;
+    QString interfaceName, lockedSerial;
     ProcessLock deviceLock;
     QByteArray out[2], meas[2];
     void check(ViStatus status, const char* operation);
     void resetForRun();
     void configureMeasurement(int index, double nplc, bool measureCurrent);
+    void verifyProbeVoltageBackstop();
+    void drainRecoveryErrors();
     void verifyIndependentChannels();
     void prepareIndependentChannels();
     void writeScpi(const QByteArray& command);

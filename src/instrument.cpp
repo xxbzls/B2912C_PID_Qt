@@ -2,16 +2,42 @@
 #include <QDir>
 #include <cmath>
 #include <algorithm>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 
+static constexpr double probeHardwareBackstopV = 17.0;
+static constexpr ViInt32 ioTimeoutMs = 5000;
 static void fail(const QString& text) { throw std::runtime_error(text.toUtf8().constData()); }
+// VISA/IVI statuses that mean the USB/LAN transport or session failed, not the
+// instrument's output. The controller treats "[COMM]" as recoverable.
+static bool isTransportStatus(ViStatus status) {
+    static const ViStatus codes[] = {
+        -1073807360, // VI_ERROR_SYSTEM_ERROR
+        -1073807346, // VI_ERROR_INV_OBJECT (session no longer valid)
+        -1073807343, // VI_ERROR_RSRC_NFOUND (USB device not enumerated)
+        -1073807339, // VI_ERROR_TMO
+        -1073807338, // VI_ERROR_CLOSING_FAILED
+        -1073807312, // VI_ERROR_ABORT
+        -1073807308, -1073807307, -1073807306, -1073807305, // VI_ERROR_*_PROT_VIOL
+        -1073807298, // VI_ERROR_IO
+        -1073807265, // VI_ERROR_NLISTENERS
+        -1073807246, // VI_ERROR_RSRC_BUSY
+        -1073807194, // VI_ERROR_CONN_LOST
+        static_cast<ViStatus>(KTB2900_ERROR_IO_GENERAL), static_cast<ViStatus>(KTB2900_ERROR_IO_TIMEOUT),
+        static_cast<ViStatus>(KTB2900_ERROR_INVALID_SESSION_HANDLE), static_cast<ViStatus>(KTB2900_ERROR_NOT_INITIALIZED),
+        static_cast<ViStatus>(KTB2900_ERROR_RESOURCE_UNKNOWN), static_cast<ViStatus>(KTB2900_ERROR_UNEXPECTED_RESPONSE),
+        static_cast<ViStatus>(KTB2900_ERROR_ID_QUERY_FAILED)};
+    return std::find(std::begin(codes), std::end(codes), status) != std::end(codes);
+}
 Instrument::~Instrument() { shutdown(); }
 void Instrument::check(ViStatus status, const char* operation) {
     if (status < 0) {
         ViStatus code = 0; char msg[1024] = {};
         if (GetError) GetError(session, &code, sizeof(msg), msg);
         QString detail = QString("%1 failed (%2): %3").arg(operation).arg(status).arg(QString::fromLocal8Bit(msg));
+        if (code != 0 && code != status) detail += QString(" (driver code %1)").arg(code);
+        if (isTransportStatus(status) || isTransportStatus(code)) detail += " [COMM]";
         // GetError returns the driver error. Only error_query retrieves the
         // instrument's SCPI error queue; capture it before cleanup changes it.
         if (status == static_cast<ViStatus>(KTB2900_ERROR_INSTRUMENT_STATUS) && session && error_query && !rawQueryPending) {
@@ -61,11 +87,20 @@ QString Instrument::open(const QString& resource, bool simulation, bool resetOnO
     QByteArray address = resource.toLatin1();
     const char* options = simulation
         ? "Cache=false, Simulate=true, QueryInstrStatus=true, DriverSetup=Model=B2912C"
-        : "Cache=false, Simulate=false, QueryInstrStatus=true";
+        : "Cache=false, Simulate=false, QueryInstrStatus=false"; // Error queue is polled explicitly.
     // Normal connections preserve state. configure() snapshots compliance before resetting.
     // Never reset until exclusive control has been obtained.
+    ownershipTimer.invalidate(); fullCheckTimer.invalidate();
     check(InitWithOptions(address.data(), VI_TRUE, VI_FALSE, options, &session), "InitWithOptions");
     sdkDiagnostic("SESSION_OPEN resource="+resource+" simulated="+QString::number(simulation));
+    if(!simulation && !lockedSerial.isEmpty()) {
+        // The instrument error queue outlives a failed SDK session. Clear the
+        // new transport boundary and remove only stale query-boundary errors
+        // before any identity/property query can surface the old -420 again.
+        check(SystemClearIO(session),"Clear newly reconnected session");
+        rawQueryPending=false;
+        drainRecoveryErrors();
+    }
     if(!simulation) {
         const QByteArray tracePath=QDir::toNativeSeparators(QCoreApplication::applicationDirPath()+
             "/Diagnostics/driver_"+QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss_zzz")+".log").toLocal8Bit();
@@ -76,7 +111,7 @@ QString Instrument::open(const QString& resource, bool simulation, bool resetOnO
         sdkDiagnostic("SDK_INTERNAL_TRACING_DISABLED memory-comparison build; application diagnostics remain enabled");
     }
     diagnosticTimer.start();
-    integer("", KTB2900_ATTR_SYSTEM_IO_TIMEOUT, 10000);
+    integer("", KTB2900_ATTR_SYSTEM_IO_TIMEOUT, ioTimeoutMs);
     char model[256] = {};
     check(GetAttributeViString(session, "", KTB2900_ATTR_INSTRUMENT_MODEL, sizeof(model), model), "Model");
     if (QString::fromLatin1(model).trimmed() != "B2912C") fail(QString("Expected B2912C, got %1").arg(model));
@@ -95,22 +130,41 @@ QString Instrument::open(const QString& resource, bool simulation, bool resetOnO
     check(GetAttributeViString(session, "", KTB2900_ATTR_SYSTEM_SERIAL_NUMBER, sizeof(serial), serial), "Serial number");
     check(GetAttributeViString(session, "", KTB2900_ATTR_INSTRUMENT_FIRMWARE_REVISION, sizeof(firmware), firmware), "Firmware revision");
     if (!simulated) {
+        const bool reconnecting = !lockedSerial.isEmpty();
         const QString serialNumber = QString::fromLatin1(serial).trimmed();
         if (serialNumber.isEmpty()) fail("无法识别仪器序列号，拒绝取得控制权。");
         // Serial number unifies VISA aliases, hostnames, HiSLIP, VXI-11 and USB addresses.
-        deviceLock.acquire("instrument:" + serialNumber.toUpper());
+        const QString normalizedSerial=serialNumber.toUpper();
+        if(lockedSerial.isEmpty()) {
+            deviceLock.acquire("instrument:" + normalizedSerial);
+            lockedSerial=normalizedSerial;
+        } else if(lockedSerial!=normalizedSerial) {
+            fail(QString("自动重连识别到不同仪器（原序列号 %1，新序列号 %2），拒绝继续输出。")
+                 .arg(lockedSerial,normalizedSerial));
+        }
         char owner[256] = {}, name[256] = {};
         check(SystemLockOwner(session,sizeof(owner),owner),"Read interface lock owner");
         const QString currentOwner = QString::fromLatin1(owner).trimmed().remove('"');
-        if (currentOwner.compare("NONE",Qt::CaseInsensitive) != 0)
-            fail("仪器接口已被占用（" + currentOwner + "），请先释放原控制会话；不会抢占或复位。");
         check(SystemLockName(session,sizeof(name),name),"Read interface name");
+        const QString previousInterface = interfaceName;
         interfaceName = QString::fromLatin1(name).trimmed().remove('"');
-        ViBoolean granted = VI_FALSE;
-        const ViStatus lockStatus = SystemRequestLock(session,&granted);
-        interfaceLocked = granted == VI_TRUE;
-        check(lockStatus,"Request instrument interface lock");
-        if (!interfaceLocked) fail("仪器拒绝控制锁，尚未配置或开启输出。");
+        sdkDiagnostic("LOCK_STATE owner="+currentOwner+" interface="+interfaceName+" reconnect="+QString::number(reconnecting));
+        if (currentOwner.compare("NONE",Qt::CaseInsensitive) != 0) {
+            // After a USB drop the instrument keeps the lock of the interface this
+            // process already owns (serial verified above, process-wide device lock
+            // still held). Adopt it instead of requesting a nested lock.
+            if (!reconnecting || currentOwner.compare(interfaceName,Qt::CaseInsensitive) != 0
+                || previousInterface.compare(interfaceName,Qt::CaseInsensitive) != 0)
+                fail("仪器接口已被占用（" + currentOwner + "），请先释放原控制会话；不会抢占或复位。");
+            interfaceLocked = true;
+            if (log) log("自动重连：仪器仍保留本机 " + interfaceName + " 接口的控制锁，直接沿用。");
+        } else {
+            ViBoolean granted = VI_FALSE;
+            const ViStatus lockStatus = SystemRequestLock(session,&granted);
+            interfaceLocked = granted == VI_TRUE;
+            check(lockStatus,"Request instrument interface lock");
+            if (!interfaceLocked) fail("仪器拒绝控制锁，尚未配置或开启输出。");
+        }
         verifyControlOwnership();
         if (log) log("已取得仪器控制锁；断开连接时释放。仪器面板在接口锁期间会锁定。");
     }
@@ -186,9 +240,20 @@ void Instrument::configureMeasurement(int i, double nplc, bool measureCurrent) {
     for (int f = 0; f < (measureCurrent ? 2 : 1); ++f)
         check(MeasurementFunctionSetEnabled(session, meas[i].constData(), 1, &functions[f]), "Enable measurement function");
 }
+void Instrument::verifyProbeVoltageBackstop() {
+    double actual = 0;
+    check(GetAttributeViReal64(session,meas[0].constData(),KTB2900_ATTR_MEASUREMENT_VOLTAGE_COMPLIANCE_VALUE,&actual),
+          "CH1 probe-voltage hardware backstop readback");
+    if (!std::isfinite(actual) || std::abs(actual-probeHardwareBackstopV)>1e-6*probeHardwareBackstopV)
+        fail(QString("CH1 探头硬件后备关断读回为 %1 V，不是要求的 ±%2 V；拒绝开启输出。")
+             .arg(actual,0,'g',12).arg(probeHardwareBackstopV,0,'g',8));
+    if(log) log(QString("CH1 探头硬件后备关断：±%1 V（已设置并读回核对）。")
+                .arg(actual,0,'g',8));
+}
 void Instrument::prepareMonitoring(double nplc) {
     if (!session || !std::isfinite(nplc) || nplc < 0.01 || nplc > 10) fail("Invalid monitoring configuration");
     verifyControlOwnership();
+    pollInstrumentErrors(); // Clear errors that predate this configuration.
     // Do not overwrite an existing source or adopt outputs started by another operator.
     if (outputEnabled(1) || outputEnabled(2))
         fail("连接采集前请先在仪器面板关闭 CH1 和 CH2；不会接管已开启的输出。");
@@ -218,7 +283,10 @@ void Instrument::prepareMonitoring(double nplc) {
     real(out[0], KTB2900_ATTR_OUTPUT_CURRENT_LEVEL, 0);
     boolean(out[0], KTB2900_ATTR_OUTPUT_CURRENT_AUTO_RANGE_ENABLED, false);
     real(out[0], KTB2900_ATTR_OUTPUT_CURRENT_RANGE, 1e-8);
-    real(meas[0], KTB2900_ATTR_MEASUREMENT_VOLTAGE_COMPLIANCE_VALUE, 12);
+    // Software protection is at most 15 V. The independent 17 V instrument
+    // backstop leaves 2 V of margin while remaining inside the 20 V range.
+    real(meas[0], KTB2900_ATTR_MEASUREMENT_VOLTAGE_COMPLIANCE_VALUE,probeHardwareBackstopV);
+    verifyProbeVoltageBackstop();
     boolean(meas[0], KTB2900_ATTR_MEASUREMENT_VOLTAGE_AUTO_RANGE_ENABLED, false);
     real(meas[0], KTB2900_ATTR_MEASUREMENT_VOLTAGE_RANGE, 20);
     configureMeasurement(0, nplc, false);
@@ -243,26 +311,35 @@ void Instrument::prepareMonitoring(double nplc) {
     ViBoolean autoOn=VI_TRUE;
     check(GetAttributeViBoolean(session,out[1].constData(),KTB2900_ATTR_OUTPUT_AUTO_ON_ENABLED,&autoOn),"CH2 auto-on readback");
     if(autoOn) fail("CH2 自动开启未关闭，拒绝启动探头采集。");
+    pollInstrumentErrors(true); // No configuration command may have been rejected.
     boolean(out[0], KTB2900_ATTR_OUTPUTS_ENABLED, true);
     checkMonitoring();
     if (log) log("探头采集已启动：CH1 保持 0 A 测压；CH2 保持关断，其设定电流和电压上限未改写。");
 }
+bool Instrument::fullCheckDue() const {
+    return simulated || !fullCheckTimer.isValid() || fullCheckTimer.elapsed() >= fullCheckIntervalMs;
+}
 void Instrument::checkMonitoring() {
     verifyControlOwnership();
-    verifyIndependentChannels();
+    const bool full = fullCheckDue();
+    if (full) verifyIndependentChannels();
     ViInt32 questionable = 0;
     check(StatusQuestionableReadConditionRegister(session,&questionable),"Read monitoring protection status");
     if (questionable & (KTB2900_VAL_STATUS_QUES_SRQ_REASON_CH1_OUTPUT_PROTECTION |
                         KTB2900_VAL_STATUS_QUES_SRQ_REASON_CH2_OUTPUT_PROTECTION))
         fail("采集保护：仪器到限关断已触发，不会自动重新开启通道。");
+    if (!full) return;
     ViBoolean compliance = VI_FALSE;
     check(GetAttributeViBoolean(session,meas[0].constData(),KTB2900_ATTR_MEASUREMENT_VOLTAGE_COMPLIANCE_STATUS_ENABLED,&compliance),"CH1 monitoring compliance");
     if (compliance || !outputEnabled(1)) fail("CH1 测压通道已关断或到限，采集停止；不会自动重启。");
     if (outputEnabled(2)) fail("采集状态下 CH2 意外开启，停止采集并关断两个通道。");
+    pollInstrumentErrors();
+    fullCheckTimer.start();
 }
 QStringList Instrument::stopControlOutput() {
     QStringList errors;
-    if (!session || !configured) return errors;
+    if (!configured) return errors;
+    if (!session) return {"SDK 会话当前不可用，无法发送或确认 CH2 关断；请恢复仪器通信或在面板手动关断。"};
     // CH2 OFF is the first operation. Never write 0 mA, ramp, or re-enable CH1 here.
     try { disableOutput(2); } catch (const std::exception& e) { errors << QString::fromUtf8(e.what()); }
     try { if (outputEnabled(2)) fail("CH2 output still enabled"); }
@@ -272,9 +349,13 @@ QStringList Instrument::stopControlOutput() {
 }
 void Instrument::configure(double voltageLimit, double nplc, bool currentTest, bool preserveVoltageLimit, double currentLimitMA) {
     if (!session || !std::isfinite(nplc) || nplc < 0.01 || nplc > 10) fail("Invalid instrument configuration");
-    if (!std::isfinite(currentLimitMA) || currentLimitMA <= 0 || currentLimitMA > 10) fail("Invalid current limit");
+    if (!std::isfinite(currentLimitMA) || currentLimitMA <= 0 || currentLimitMA > 100) fail("Invalid current limit");
     verifyControlOwnership();
+    pollInstrumentErrors(); // Clear errors that predate this configuration.
     currentLimitAmps = currentLimitMA/1000.0;
+    // B2912C provides discrete source/measurement ranges. Retain the 10 mA
+    // range for the existing default and select 100 mA only when requested.
+    const double currentRangeAmps = currentLimitMA <= 10 ? 0.01 : 0.1;
     // Read BEFORE reset: the reset would otherwise discard the customer's setting.
     // B2912C uses one symmetric compliance value (the POS/NEG attributes target other models).
     if (preserveVoltageLimit) voltageLimit = outputVoltageLimit();
@@ -295,17 +376,24 @@ void Instrument::configure(double voltageLimit, double nplc, bool currentTest, b
         integer(out[i], KTB2900_ATTR_OUTPUT_TYPE, KTB2900_VAL_OUTPUT_TYPE_CURRENT);
         real(out[i], KTB2900_ATTR_OUTPUT_CURRENT_LEVEL, 0);
         boolean(out[i], KTB2900_ATTR_OUTPUT_CURRENT_AUTO_RANGE_ENABLED, false);
-        real(out[i], KTB2900_ATTR_OUTPUT_CURRENT_RANGE, i == 0 ? 1e-8 : 0.01);
-        real(meas[i], KTB2900_ATTR_MEASUREMENT_VOLTAGE_COMPLIANCE_VALUE, i == 0 ? 12.0 : voltageLimit);
+        real(out[i], KTB2900_ATTR_OUTPUT_CURRENT_RANGE, i == 0 ? 1e-8 : currentRangeAmps);
+        if(i==1) {
+            boolean(meas[i],KTB2900_ATTR_MEASUREMENT_CURRENT_AUTO_RANGE_ENABLED,false);
+            real(meas[i],KTB2900_ATTR_MEASUREMENT_CURRENT_RANGE,currentRangeAmps);
+        }
+        real(meas[i], KTB2900_ATTR_MEASUREMENT_VOLTAGE_COMPLIANCE_VALUE,
+             i == 0 ? probeHardwareBackstopV : voltageLimit);
         const bool autoVoltageRange = i == 1 && voltageLimit > 20;
         boolean(meas[i], KTB2900_ATTR_MEASUREMENT_VOLTAGE_AUTO_RANGE_ENABLED, autoVoltageRange);
         if (!autoVoltageRange) real(meas[i], KTB2900_ATTR_MEASUREMENT_VOLTAGE_RANGE, 20);
         configureMeasurement(i, nplc, i == 1);
     }
+    if(!currentTestOnly) verifyProbeVoltageBackstop();
     const double actualLimit = outputVoltageLimit();
     if (std::abs(actualLimit-voltageLimit) > 1e-6 * std::max(1.0,voltageLimit))
         fail("CH2 电压上限读回与配置不一致；尚未开启输出。");
     verifyOutputProtection();
+    pollInstrumentErrors(true); // No configuration command may have been rejected.
     // Keep the established voltage monitor available even if startup is cancelled
     // after configuration. A fault bypasses normal stop and shuts down both channels.
     if (monitoringSession && !currentTestOnly) boolean(out[0], KTB2900_ATTR_OUTPUTS_ENABLED, true);
@@ -313,6 +401,8 @@ void Instrument::configure(double voltageLimit, double nplc, bool currentTest, b
     if (log) log("保护配置已读回：仪器到限关断已开启，测量自动开启输出已关闭。");
     if (log) log(QString("CH2 电压上限：±%1 V（%2）；电流由 PID 或手动设定，继续受电流限幅约束。")
         .arg(actualLimit,0,'g',8).arg(preserveVoltageLimit ? "保留仪器原值，复位后已恢复并核对" : "高级设置覆盖，已读回核对"));
+    if (log) log(QString("CH2 电流量程：±%1 mA；本次软件限幅：±%2 mA。")
+        .arg(currentRangeAmps*1000,0,'g',8).arg(currentLimitMA,0,'g',8));
 }
 void Instrument::enable() {
     if (!configured || !runConfigured) fail("Instrument not configured for control output");
@@ -412,12 +502,17 @@ void Instrument::checkCompliance() {
                                              : KTB2900_VAL_STATUS_QUES_SRQ_REASON_CH2_OUTPUT_PROTECTION;
         if (questionable & protectionBit)
             fail(QString("保护停机：CH%1 仪器到限关断已触发；检查负载和电压上限后再手动启动。").arg(i+1));
+    }
+    if (!fullCheckDue()) return;
+    for (int i = currentTestOnly ? 1 : 0; i < 2; ++i) {
         ViBoolean active = VI_FALSE;
         check(GetAttributeViBoolean(session, meas[i].constData(), KTB2900_ATTR_MEASUREMENT_VOLTAGE_COMPLIANCE_STATUS_ENABLED, &active), "Voltage compliance");
         if (active) fail(QString("CH%1 达到电压合规上限，设定电流可能无法达到；将停止并尝试关断。请检查负载及仪器电压上限。").arg(i+1));
         if (!outputEnabled(i+1))
             fail(QString("保护停机：CH%1 输出意外关闭，可能已触发仪器保护或被外部操作关闭；不会自动重启。").arg(i+1));
     }
+    pollInstrumentErrors();
+    fullCheckTimer.start();
 }
 void Instrument::verifyOutputProtection() {
     for (int i = 0; i < 2; ++i) {
@@ -434,26 +529,114 @@ void Instrument::verifyOutputProtection() {
 void Instrument::verifyControlOwnership() {
     if (simulated) return;
     if (!session || !interfaceLocked) fail("未取得仪器控制锁，拒绝控制。");
+    if (ownershipTimer.isValid() && ownershipTimer.elapsed() < fullCheckIntervalMs) return;
     char owner[256] = {};
     check(SystemLockOwner(session,sizeof(owner),owner),"Verify instrument interface lock");
     if (QString::fromLatin1(owner).trimmed().remove('"') != interfaceName)
         fail("仪器控制锁已丢失，停止运行并尝试关断输出。");
+    ownershipTimer.start();
+}
+// Returns true if the entry was cleared and operation may continue.
+bool Instrument::handleInstrumentError(ViInt32 code, const QString& text, bool duringRecovery) {
+    sdkDiagnostic(QString("%1 code=%2 message=%3").arg(duringRecovery ? "RECOVERY_ERROR_QUEUE" : "ERROR_QUEUE").arg(code).arg(text));
+    if (code==-410 || code==-420 || code==-430 || code==-440) {
+        if (duringRecovery) {
+            if(log) log(QString("通信恢复已清除查询边界错误 %1：%2").arg(code).arg(text));
+            return true;
+        }
+        // A broken query boundary needs Device Clear before further queries.
+        fail(QString("仪器报告查询边界错误 %1：%2；进入通信恢复。 [COMM]").arg(code).arg(text));
+    }
+    // Hardware/module, self-test and system errors must stop the output.
+    if (code==-240 || code==-241 || (code<=-300 && code>=-399) || code>0)
+        fail(QString("%1发现仪器错误 %2：%3；为避免掩盖真实故障，将停止并关断。")
+             .arg(duringRecovery ? "通信恢复" : "错误队列检查").arg(code).arg(text));
+    // Command/execution errors (-100..-299) leave the output state unchanged;
+    // record them and continue. Output and protection are verified separately.
+    if(log) log(QString("仪器错误队列：%1 %2（已记录并清除，不影响输出）").arg(code).arg(text));
+    return true;
+}
+void Instrument::pollInstrumentErrors(bool strict) {
+    if (simulated || !session || !error_query) return;
+    for(int index=0;index<16;++index) {
+        ViInt32 code=0;char message[2048]={};
+        rawQueryPending=true;
+        const ViStatus status=error_query(session,&code,message);
+        if(status<0) check(status,"Poll instrument error queue");
+        rawQueryPending=false;
+        if(code==0) return;
+        const QString text=QString::fromLocal8Bit(message).trimmed();
+        if(strict) {
+            sdkDiagnostic(QString("CONFIG_ERROR_QUEUE code=%1 message=%2").arg(code).arg(text));
+            fail(QString("配置期间仪器报告错误 %1：%2；拒绝开启输出。").arg(code).arg(text));
+        }
+        handleInstrumentError(code,text,false);
+    }
+    fail("仪器错误队列超过16项且未清空；进入通信恢复。 [COMM]");
+}
+void Instrument::drainRecoveryErrors() {
+    // Device Clear restores the transport boundary, but the instrument error
+    // queue may still contain the query error caused by the interrupted
+    // transaction. With QueryInstrStatus enabled, the next unrelated driver
+    // call would surface that stale -410/-420/-430/-440 and abort recovery.
+    for(int index=0;index<16;++index) {
+        ViInt32 code=0;char message[2048]={};
+        rawQueryPending=true;
+        const ViStatus status=error_query(session,&code,message);
+        if(status<0) check(status,"Drain instrument errors after Device Clear");
+        rawQueryPending=false;
+        if(status>0 && log) log(QString("SDK warning Drain instrument errors after Device Clear: %1").arg(status));
+        if(code==0) return;
+        handleInstrumentError(code,QString::fromLocal8Bit(message).trimmed(),true);
+    }
+    fail("通信恢复时仪器错误队列超过16项且未清空；将停止并关断。");
 }
 void Instrument::recoverCommunication() {
-    check(SystemClearIO(session),"Recover communication boundary");
+    try {check(SystemClearIO(session),"Recover communication boundary");}
+    catch(...) {rawQueryPending=true;throw;}
     rawQueryPending=false;
+    ownershipTimer.invalidate(); fullCheckTimer.invalidate();
+    drainRecoveryErrors();
     verifyControlOwnership();
     verifyIndependentChannels();
-    checkCompliance();
+    if(monitoringSession && !runConfigured) checkMonitoring();
+    else checkCompliance();
+}
+QString Instrument::reconnect(const QString& resource) {
+    if(simulated || lockedSerial.isEmpty()) fail("自动重连要求仍持有原仪器的本机控制锁。");
+    const ViSession staleSession=session;
+    session=VI_NULL;
+    interfaceLocked=false;
+    rawQueryPending=false;
+    if(staleSession && close) {
+        const ViStatus closeStatus=close(staleSession);
+        sdkDiagnostic(QString("RECONNECT_CLOSE_STALE status=%1").arg(closeStatus));
+        if(closeStatus<0 && log) log(QString("旧 SDK 会话关闭返回 %1；继续尝试建立新会话。").arg(closeStatus));
+    }
+    try {
+        const QString identity=open(resource,false,false);
+        sdkDiagnostic("RECONNECT_SESSION_OPENED identity="+identity);
+        return identity;
+    } catch(...) {
+        const ViSession failedSession=session;
+        session=VI_NULL;
+        interfaceLocked=false;
+        rawQueryPending=false;
+        if(failedSession && close) close(failedSession);
+        throw;
+    }
 }
 void Instrument::resetForRun() {
     if (!session) fail("Connect the instrument before starting output");
     check(reset(session), "Reset before output run");
-    integer("", KTB2900_ATTR_SYSTEM_IO_TIMEOUT, 10000);
+    integer("", KTB2900_ATTR_SYSTEM_IO_TIMEOUT, ioTimeoutMs);
 }
 QStringList Instrument::stopOutputs() {
     QStringList errors;
-    if (!session) return errors;
+    if (!session) {
+        if(configured) errors << "SDK 会话当前不可用，无法发送或确认 CH2、CH1 关断；请在仪器面板检查。";
+        return errors;
+    }
     auto attempt = [&](const std::function<void()>& fn) { try { fn(); } catch(const std::exception& e) { errors << QString::fromUtf8(e.what()); } };
     if (configured) {
         // A timed-out query may leave a response in the transport. Device Clear
@@ -483,7 +666,7 @@ void Instrument::disableOutput(int channel) {
 }
 QStringList Instrument::shutdown() {
     QStringList errors=stopOutputs();
-    if (!session) { deviceLock.release(); return errors; }
+    if (!session) { deviceLock.release(); lockedSerial.clear(); return errors; }
     if (interfaceLocked) {
         try { check(SystemReleaseLock(session),"Release instrument interface lock"); }
         catch(const std::exception& e) { errors << QString::fromUtf8(e.what()); }
@@ -492,6 +675,6 @@ QStringList Instrument::shutdown() {
     try { check(close(session), "Close"); }
     catch(const std::exception& e) { errors << QString::fromUtf8(e.what()); }
     session = VI_NULL; configured = false; runConfigured = false; monitoringSession = false; rawQueryPending = false;
-    deviceLock.release();
+    deviceLock.release(); lockedSerial.clear();
     return errors;
 }

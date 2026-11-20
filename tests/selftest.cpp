@@ -33,12 +33,12 @@ int selftest(bool sdk) {
             auto errors=instrument.shutdown();
             require(errors.isEmpty(),"SDK disable / close: "+errors.join("; "));
             results << instrument.open("CurrentTestSimulationOnly",true);
-            instrument.configure(3.5,0.1,true);
+            instrument.configure(3.5,0.1,true,false,100);
             require(std::abs(instrument.outputVoltageLimit()-3.5)<1e-8,"Explicit override reads back 3.5 V");
             instrument.enable();
             require(!instrument.outputEnabled(1),"Current test keeps CH1 disabled");
             require(instrument.outputEnabled(2),"Current test enables CH2");
-            for(double amps:{0.001,-0.001,0.0}) {
+            for(double amps:{0.1,-0.1,0.001,-0.001,0.0}) {
                 instrument.setCurrent(amps);
                 require(std::abs(instrument.currentSetting()-amps)<1e-10,"CH2-only positive / negative / zero setpoint");
                 require(std::isfinite(instrument.readCurrent()) && std::isfinite(instrument.readOutputVoltage()),"CH2-only acquire / wait / fetch");
@@ -75,15 +75,27 @@ int selftest(bool sdk) {
             require(instrument.shutdown().isEmpty(),"Unconfigured probe closes session without output setup");
         } else {
             Settings defaults;
+            require(defaults.probeVoltageLimit==15,"Default probe-voltage shutdown threshold is +/-15 V");
+            defaults.probeVoltageLimit=5;defaults.targetV=5;defaults.validate();
+            require(true,"Configurable probe-voltage threshold accepts its target endpoint");
+            bool badProbeLimit=false;
+            defaults.probeVoltageLimit=15.001;try{defaults.validate();}catch(...){badProbeLimit=true;}
+            require(badProbeLimit,"Reject probe-voltage threshold above 15 V");
+            defaults=Settings();defaults.probeVoltageLimit=5;defaults.targetV=5.001;badProbeLimit=false;
+            try{defaults.validate();}catch(...){badProbeLimit=true;}
+            require(badProbeLimit,"Reject a target outside the configured probe-voltage protection threshold");
+            defaults=Settings();
             require(!defaults.overrideVoltageLimit,"Voltage limit override is opt-in");
             defaults.voltageLimit=std::numeric_limits<double>::quiet_NaN();defaults.validate();
             require(true,"Inactive voltage limit is ignored");
             defaults.overrideVoltageLimit=true;
             bool badOverride=false;try{defaults.validate();}catch(...){badOverride=true;}
             require(badOverride,"Active invalid voltage limit is rejected");
-            defaults=Settings();defaults.limitMA=10.001;
+            defaults=Settings();defaults.limitMA=100;defaults.manual=true;defaults.manualMA=-100;defaults.validate();
+            require(true,"Accept configurable current-limit and manual-current endpoints at +/-100 mA");
+            defaults=Settings();defaults.limitMA=100.001;
             bool badCurrent=false;try{defaults.validate();}catch(...){badCurrent=true;}
-            require(badCurrent,"Customer current limit cannot exceed 10 mA");
+            require(badCurrent,"Customer current limit cannot exceed 100 mA");
             for(double targetV:{0.012,-0.012}) {
                 Settings resistor;resistor.targetV=targetV;resistor.kp=20;resistor.ti=0.5;resistor.td=0;resistor.limitMA=2;
                 VoltagePid resistorPid(resistor);double voltage=0,current=0;

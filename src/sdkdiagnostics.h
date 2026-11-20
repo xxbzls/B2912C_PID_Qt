@@ -17,6 +17,26 @@ inline void sdkDiagnostic(const QString& text) {
         file.flush();
     }
 }
+// Persistent copy of the on-screen run log: Logs/run_yyyyMMdd.log, kept 180 days.
+inline void runLog(const QString& text) {
+    static QMutex mutex;
+    static QString prunedDay;
+    QMutexLocker guard(&mutex);
+    const QDateTime now=QDateTime::currentDateTime();
+    const QString directory=QCoreApplication::applicationDirPath()+"/Logs";
+    QDir().mkpath(directory);
+    const QString day=now.toString("yyyyMMdd");
+    if(prunedDay!=day) {
+        prunedDay=day;
+        const QFileInfoList old=QDir(directory).entryInfoList({"run_*.log"},QDir::Files);
+        for(const QFileInfo& info:old) if(info.lastModified().daysTo(now)>180) QFile::remove(info.absoluteFilePath());
+    }
+    QFile file(directory+"/run_"+day+".log");
+    if(file.open(QIODevice::Append)) {
+        file.write((now.toString("yyyy-MM-dd HH:mm:ss.zzz")+"  "+text+"\r\n").toUtf8());
+        file.flush();
+    }
+}
 inline bool diagnosticImportant(const QString& name) {
     return name.contains("InitWithOptions") || name.contains("Tracing")
         || name.contains("RequestLock") || name.contains("ReleaseLock")

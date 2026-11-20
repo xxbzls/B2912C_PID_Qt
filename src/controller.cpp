@@ -7,12 +7,34 @@
 #include <stdexcept>
 #include <memory>
 
+namespace {
+bool isQueryBoundaryError(const QString& detail) {
+    return detail.contains("Query UNTERMINATED",Qt::CaseInsensitive)
+        || detail.contains("Query INTERRUPTED",Qt::CaseInsensitive)
+        || detail.contains("Query DEADLOCKED",Qt::CaseInsensitive)
+        || detail.contains("Query DEADLOCK",Qt::CaseInsensitive)
+        || detail.contains("-410") || detail.contains("-420")
+        || detail.contains("-430") || detail.contains("-440");
+}
+bool isRecoverableTransportError(const QString& detail) {
+    return detail.contains("[COMM]") // Tagged by Instrument::check from the VISA/IVI status code.
+        || detail.contains("VI_ERROR_RSRC_NFOUND",Qt::CaseInsensitive)
+        || detail.contains("VI_ERROR_CONN_LOST",Qt::CaseInsensitive)
+        || detail.contains("connection for the given session has been lost",Qt::CaseInsensitive)
+        || detail.contains("I/O error",Qt::CaseInsensitive)
+        || detail.contains("I/O failure",Qt::CaseInsensitive)
+        || detail.contains("timeout",Qt::CaseInsensitive)
+        || detail.contains("connection lost",Qt::CaseInsensitive)
+        || isQueryBoundaryError(detail);
+}
+}
+
 void Settings::validate() const {
-    for (double v : {limitMA,nplc,manualMA})
+    for (double v : {limitMA,probeVoltageLimit,nplc,manualMA})
         if (!std::isfinite(v)) throw std::runtime_error("Parameters must be finite");
-    if (mode < 0 || mode > 2 || limitMA <= 0 || limitMA > 10
+    if (mode < 0 || mode > 2 || limitMA <= 0 || limitMA > 100
         || ((manual || currentTest) && std::abs(manualMA) > limitMA) || periodMs < 20 || periodMs > 2000
-        || nplc < 0.01 || nplc > 10)
+        || probeVoltageLimit < 0.1 || probeVoltageLimit > 15 || nplc < 0.01 || nplc > 10)
         throw std::runtime_error("Parameters outside supported range");
     if (overrideVoltageLimit && (!std::isfinite(voltageLimit) || voltageLimit < 0.1 || voltageLimit > 20))
         throw std::runtime_error("Override voltage limit must be within 0.1 to 20 V");
@@ -23,6 +45,8 @@ void Settings::validate() const {
         if (kp < 0 || ti < 0 || td < 0 || std::abs(direction) != 1)
             throw std::runtime_error("Invalid PID settings");
         if (std::abs(targetV) > 10) throw std::runtime_error("Target voltage must be within +/-10 V");
+        if (std::abs(targetV) > probeVoltageLimit)
+            throw std::runtime_error("Target voltage must not exceed the probe-voltage protection threshold");
     }
 }
 VoltagePid::VoltagePid(const Settings& settings) : s(settings) {
@@ -30,8 +54,8 @@ VoltagePid::VoltagePid(const Settings& settings) : s(settings) {
     PID_Init(&pid, s.kp, s.ti, s.td, s.periodMs/1000.0, -s.limitMA, s.limitMA);
 }
 void VoltagePid::setTargetVoltage(double volts) {
-    if (!std::isfinite(volts) || std::abs(volts)>10)
-        throw std::runtime_error("Target voltage must be finite and within +/-10 V");
+    if (!std::isfinite(volts) || std::abs(volts)>10 || std::abs(volts)>s.probeVoltageLimit)
+        throw std::runtime_error("Target voltage must be finite, within +/-10 V, and inside the probe-voltage protection threshold");
     s.targetV=volts;
 }
 double VoltagePid::step(double feedbackV, double seconds) {
@@ -69,7 +93,7 @@ void ControlThread::allowTargetUpdates(bool enabled) {
     targetPending=false;
 }
 bool ControlThread::requestTargetVoltage(double volts) {
-    if (!std::isfinite(volts) || std::abs(volts)>10) return false;
+    if (!std::isfinite(volts) || std::abs(volts)>10 || std::abs(volts)>settings.probeVoltageLimit) return false;
     QMutexLocker lock(&targetMutex);
     if (!acceptingTargets || shouldStop() || targetPending) return false;
     pendingTarget=volts;targetPending=true;
@@ -80,6 +104,63 @@ bool ControlThread::takeTargetVoltage(double& volts) {
     if (!acceptingTargets || shouldStop() || !targetPending) return false;
     volts=pendingTarget;targetPending=false;
     return true;
+}
+bool ControlThread::recoverInstrument(Instrument& instrument, const QString& initialError,
+                                      const std::function<void()>& verifyState) {
+    sdkDiagnostic("RECOVERY_BEGIN "+initialError);
+    QElapsedTimer outage;outage.start();
+    const auto outageText=[&]{return QString("中断时长 %1 s").arg(outage.elapsed()/1000.0,0,'f',1);};
+    emit message("通信异常，PID/采集已暂停，软件不主动改写输出；仪器未重启时会保持最后一次设定。先修复当前会话，必要时自动重连："+initialError);
+    for(int attempt=1;attempt<=3 && !shouldStop();++attempt) {
+        for(int wait=0;wait<10 && !shouldStop();++wait) msleep(100);
+        if(shouldStop()) return false;
+        try {
+            instrument.recoverCommunication();
+            verifyState();
+            emit message(QString("第%1次通信恢复成功（%2），输出、保护和反馈核验通过；继续闭环，不补算中断期间积分。").arg(attempt).arg(outageText()));
+            sdkDiagnostic("RECOVERY_SUCCESS attempt="+QString::number(attempt)+" outage_ms="+QString::number(outage.elapsed()));
+            return true;
+        } catch(const std::exception& recoveryError) {
+            const QString detail=QString::fromUtf8(recoveryError.what());
+            sdkDiagnostic("RECOVERY_FAILED attempt="+QString::number(attempt)+" "+detail);
+            emit message(QString("第%1次当前会话恢复失败：%2").arg(attempt).arg(detail));
+            if(!isRecoverableTransportError(detail)
+                || detail.contains("-241") || detail.contains("Module failed",Qt::CaseInsensitive)) throw;
+        }
+    }
+    int reconnectAttempt=0;
+    emit message("当前 SDK 会话无法恢复；程序保持运行并每秒自动重建连接。重连期间不更新 PID，也不主动改写仪器输出。");
+    while(!shouldStop()) {
+        for(int wait=0;wait<10 && !shouldStop();++wait) msleep(100);
+        if(shouldStop()) return false;
+        ++reconnectAttempt;
+        try {
+            const QString identity=instrument.reconnect(settings.resource.trimmed());
+            emit message(QString("第%1次自动重连已建立新会话：%2；正在核验原输出状态。").arg(reconnectAttempt).arg(identity));
+            sdkDiagnostic("RECONNECT_OPEN_SUCCESS attempt="+QString::number(reconnectAttempt));
+        } catch(const std::exception& reconnectError) {
+            const QString detail=QString::fromUtf8(reconnectError.what());
+            sdkDiagnostic("RECONNECT_OPEN_FAILED attempt="+QString::number(reconnectAttempt)+" "+detail);
+            // Keep the run log readable during a long USB absence; every attempt is in Diagnostics.
+            if(reconnectAttempt<=5 || reconnectAttempt%30==0)
+                emit message(QString("第%1次自动重连失败（%2），1秒后继续：%3").arg(reconnectAttempt).arg(outageText()).arg(detail));
+            continue;
+        }
+        try {
+            instrument.recoverCommunication();
+            instrument.verifyOutputProtection();
+            verifyState();
+            emit message(QString("第%1次自动重连成功（%2）：确认是原仪器，输出、硬件保护和反馈均正常；继续闭环。").arg(reconnectAttempt).arg(outageText()));
+            sdkDiagnostic("RECONNECT_VERIFIED attempt="+QString::number(reconnectAttempt)+" outage_ms="+QString::number(outage.elapsed()));
+            return true;
+        } catch(const std::exception& verifyError) {
+            const QString detail=QString::fromUtf8(verifyError.what());
+            sdkDiagnostic("RECONNECT_VERIFY_FAILED attempt="+QString::number(reconnectAttempt)+" "+detail);
+            if(!isRecoverableTransportError(detail)) throw;
+            emit message(QString("重连后的通信核验仍失败，1秒后重新建立会话：%1").arg(detail));
+        }
+    }
+    return false;
 }
 void ControlThread::run() {
     auto ownedInstrument = createInstrument();
@@ -103,7 +184,7 @@ void ControlThread::runControl(Instrument& instrument) {
         allowTargetUpdates(false);
         const auto targetCleanup=qScopeGuard([this]{allowTargetUpdates(false);});
         settings.validate();
-        MeasurementProtection protection(settings.limitMA,settings.periodMs);
+        MeasurementProtection protection(settings.limitMA,settings.periodMs,settings.probeVoltageLimit);
         std::unique_ptr<VoltagePid> pid;
         if (!settings.currentTest) pid.reset(new VoltagePid(settings));
         if (settings.mode != 0) {
@@ -123,6 +204,13 @@ void ControlThread::runControl(Instrument& instrument) {
                          .arg(settings.manualMA, 0, 'f', 4));
         } else emit message(settings.mode == 0 ? "电压反馈仿真：1 mA 对应稳态 1 V，时间常数 0.8 s，正电流使探头电压增大。" :
                      settings.mode == 1 ? "IVI 驱动仿真：测量值由 SDK 模拟，不代表实际反馈响应" : "真实仪器已启动：CH1 探头电压与目标电压比较，PID 输出 CH2 电流。");
+        if(!settings.currentTest) {
+            QString protectionText=QString("探头电压软件保护阈值：±%1 V").arg(settings.probeVoltageLimit,0,'g',8);
+            if(settings.mode==2) protectionText+="；CH1 仪器硬件后备关断：±17 V（已读回核对）。";
+            else if(settings.mode==1) protectionText+="；±17 V 硬件后备值已由 IVI 驱动仿真读回，不代表真实关断动作。";
+            else protectionText+="；纯软件仿真未连接仪器。";
+            emit message(protectionText);
+        }
         QElapsedTimer& clock = sampleClock; clock.start();
         allowTargetUpdates(!settings.currentTest && !settings.manual);
         qint64 previousNs = 0;
@@ -208,37 +296,19 @@ void ControlThread::runControl(Instrument& instrument) {
             while (!shouldStop() && (clock.nsecsElapsed()-cycleStart)/1000000 < settings.periodMs) msleep(5);
             } catch(const std::exception& error) {
                 const QString reason=QString::fromUtf8(error.what());
-                if(settings.mode!=2 || !reason.contains("I/O error",Qt::CaseInsensitive)
+                if(settings.mode!=2 || !isRecoverableTransportError(reason)
                     || reason.contains("-241") || reason.contains("Module failed",Qt::CaseInsensitive)) throw;
-                sdkDiagnostic("RECOVERY_BEGIN "+reason);
-                emit message("通信异常，暂停PID，开始最多3次通信恢复；仪器实际输出状态待核验："+reason);
-                bool recovered=false;
-                for(int attempt=1;attempt<=3 && !shouldStop();++attempt) {
-                    for(int wait=0;wait<10 && !shouldStop();++wait) msleep(100);
-                    if(shouldStop()) break;
-                    try {
-                        instrument.recoverCommunication();
-                        const double feedback=settings.currentTest ? 0 : instrument.readVoltage();
-                        if(!settings.currentTest) protection.checkFeedback(feedback);
-                        const double setting=instrument.currentSetting()*1000.0;
-                        const double actual=instrument.readCurrent()*1000.0;
-                        protection.checkCurrent(setting,actual,clock.nsecsElapsed()/1e9);
-                        instrument.checkCompliance();
-                        lastCurrent=setting;lastMeasured=actual;
-                        previousNs=0;consecutiveDelayedSamples=0;
-                        recovered=true;
-                        emit message(QString("第%1次通信恢复成功，输出与反馈检查通过；使用新反馈继续，不补算中断期间积分。").arg(attempt));
-                        sdkDiagnostic("RECOVERY_SUCCESS attempt="+QString::number(attempt));
-                        break;
-                    } catch(const std::exception& recoveryError) {
-                        const QString detail=QString::fromUtf8(recoveryError.what());
-                        sdkDiagnostic("RECOVERY_FAILED attempt="+QString::number(attempt)+" "+detail);
-                        emit message(QString("第%1次恢复失败：%2").arg(attempt).arg(detail));
-                        if(!detail.contains("I/O error",Qt::CaseInsensitive)
-                            || detail.contains("-241") || detail.contains("Module failed",Qt::CaseInsensitive)) throw;
-                    }
-                }
-                if(!recovered && !shouldStop()) throw;
+                const bool recovered=recoverInstrument(instrument,reason,[&]{
+                    const double feedback=settings.currentTest ? 0 : instrument.readVoltage();
+                    if(!settings.currentTest) protection.checkFeedback(feedback);
+                    const double setting=instrument.currentSetting()*1000.0;
+                    const double actual=instrument.readCurrent()*1000.0;
+                    protection.checkCurrent(setting,actual,clock.nsecsElapsed()/1e9);
+                    instrument.checkCompliance();
+                    lastCurrent=setting;lastMeasured=actual;
+                });
+                if(!recovered) break;
+                previousNs=0;consecutiveDelayedSamples=0;
             }
         }
 }
@@ -276,19 +346,39 @@ void SessionThread::run() {
             }
             if(!runPending) {
                 QElapsedTimer cycle;cycle.start();
-                if(!settings.currentTest) {
-                    instrument.checkMonitoring();
-                    const double voltage=instrument.readVoltage();
-                    if(settings.mode!=1) MeasurementProtection(settings.limitMA,settings.periodMs).checkFeedback(voltage);
-                    instrument.checkMonitoring(); // A measurement may have tripped CH1 protection.
-                    const qint64 now=sampleClock.nsecsElapsed();
-                    const double dt=previousMonitorNs<0 ? 0 : (now-previousMonitorNs)/1e6;
-                    previousMonitorNs=now;
-                    if(!isInterruptionRequested()) emit monitorSample(now/1e9,voltage,dt);
-                } else {
-                    // Legacy offline current-only tests do not use CH1.
-                    instrument.verifyControlOwnership();
-                    if(instrument.outputEnabled(2)) throw std::runtime_error("CH2 unexpectedly enabled while idle");
+                try {
+                    if(!settings.currentTest) {
+                        instrument.checkMonitoring();
+                        const double voltage=instrument.readVoltage();
+                        if(settings.mode!=1) MeasurementProtection(settings.limitMA,settings.periodMs,settings.probeVoltageLimit).checkFeedback(voltage);
+                        instrument.checkMonitoring(); // A measurement may have tripped CH1 protection.
+                        const qint64 now=sampleClock.nsecsElapsed();
+                        const double dt=previousMonitorNs<0 ? 0 : (now-previousMonitorNs)/1e6;
+                        previousMonitorNs=now;
+                        if(!isInterruptionRequested()) emit monitorSample(now/1e9,voltage,dt);
+                    } else {
+                        // Legacy offline current-only tests do not use CH1.
+                        instrument.verifyControlOwnership();
+                        if(instrument.outputEnabled(2)) throw std::runtime_error("CH2 unexpectedly enabled while idle");
+                    }
+                } catch(const std::exception& error) {
+                    const QString reason=QString::fromUtf8(error.what());
+                    if(settings.mode!=2 || !isRecoverableTransportError(reason)
+                        || reason.contains("-241") || reason.contains("Module failed",Qt::CaseInsensitive)) throw;
+                    const bool recovered=recoverInstrument(instrument,reason,[&]{
+                        if(!settings.currentTest) {
+                            instrument.checkMonitoring();
+                            const double voltage=instrument.readVoltage();
+                            MeasurementProtection(settings.limitMA,settings.periodMs,settings.probeVoltageLimit).checkFeedback(voltage);
+                            instrument.checkMonitoring();
+                        } else {
+                            instrument.verifyControlOwnership();
+                            if(instrument.outputEnabled(2)) throw std::runtime_error("CH2 unexpectedly enabled while idle");
+                        }
+                    });
+                    if(!recovered) break;
+                    previousMonitorNs=-1;
+                    continue;
                 }
                 QMutexLocker lock(&mutex);
                 const qint64 remaining=settings.periodMs-cycle.elapsed();

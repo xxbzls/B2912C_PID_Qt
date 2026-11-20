@@ -13,11 +13,12 @@
 #include <stdexcept>
 
 namespace {
-enum class Fault { None, HighFeedback, LowFeedback, Overcurrent, Undercurrent, HardwareOff, LockLost };
+enum class Fault { None, HighFeedback, LowFeedback, Overcurrent, Undercurrent, HardwareOff, LockLost, Communication };
 struct FakeState {
     Fault fault = Fault::None;
     bool on[2] = {}, closed = false, currentOnly = false;
     int enables = 0, measurements = 0, configurations = 0;
+    int communicationFailures = 0, recoveries = 0, reconnectAttempts = 0;
     double amps = 0;
     QList<double> commands;
 };
@@ -41,7 +42,9 @@ public:
     }
     QStringList stopControlOutput() override {s.on[1]=false;return {};}
     double readVoltage() override {
-        return s.fault==Fault::HighFeedback ? 10.0001 : s.fault==Fault::LowFeedback ? -10.0001 : 0;
+        if(s.fault==Fault::Communication && s.communicationFailures++==0)
+            throw std::runtime_error("Injected I/O error during feedback acquisition");
+        return s.fault==Fault::HighFeedback ? 15.0001 : s.fault==Fault::LowFeedback ? -15.0001 : 0;
     }
     double readCurrent() override {
         ++s.measurements;
@@ -54,9 +57,22 @@ public:
     double outputVoltageLimit() override {return 2;}
     bool outputEnabled(int channel) override {return s.on[channel-1];}
     void setCurrent(double amps) override {s.amps=amps;s.commands<<amps;}
+    double currentSetting() override {return s.amps;}
     void checkCompliance() override {if(!s.on[1]) throw std::runtime_error("Injected hardware output trip");}
+    void verifyOutputProtection() override {}
     void verifyControlOwnership() override {
         if(s.fault==Fault::LockLost) throw std::runtime_error("Injected lost device lock");
+    }
+    void recoverCommunication() override {
+        ++s.recoveries;
+        if(s.fault==Fault::Communication) throw std::runtime_error("Injected recovery I/O error");
+        checkCompliance();
+    }
+    QString reconnect(const QString&) override {
+        ++s.reconnectAttempts;
+        if(s.reconnectAttempts==1) throw std::runtime_error("Injected new-session open failure");
+        s.fault=Fault::None;
+        return "B2912C RECONNECTED TEST DOUBLE";
     }
     QStringList stopOutputs() override {s.on[0]=s.on[1]=false;return {};}
     QStringList shutdown() override {auto errors=stopOutputs();s.closed=true;return errors;}
@@ -116,21 +132,25 @@ int protectionTest() {
         try { action(); } catch(const std::exception&) { return true; } return false;
     };
     try {
-        MeasurementProtection boundary(1,100);
-        for (double volts : {-10.0,0.0,10.0}) boundary.checkFeedback(volts);
-        require(true,"Accept feedback endpoints +/-10 V");
-        for (double volts : {-10.000001,10.000001}) {
-            MeasurementProtection monitor(1,100);
-            require(rejects([&]{monitor.checkFeedback(volts);}),"Reject feedback outside +/-10 V");
-            require(rejects([&]{monitor.checkFeedback(0);}),"Voltage fault stays latched after signal recovers");
-            require(rejects([&]{monitor.checkCurrent(0,0,1);}),"Voltage fault blocks subsequent current checks");
+        for (double threshold : {0.1,7.5,15.0}) {
+            MeasurementProtection boundary(1,100,threshold);
+            for (double volts : {-threshold,0.0,threshold}) boundary.checkFeedback(volts);
+            require(true,QString("Accept feedback endpoints at configurable +/- %1 V").arg(threshold));
+            for (double volts : {-threshold-0.000001,threshold+0.000001}) {
+                MeasurementProtection monitor(1,100,threshold);
+                require(rejects([&]{monitor.checkFeedback(volts);}),"Reject feedback outside the configured symmetric threshold");
+                require(rejects([&]{monitor.checkFeedback(0);}),"Voltage fault stays latched after signal recovers");
+                require(rejects([&]{monitor.checkCurrent(0,0,1);}),"Voltage fault blocks subsequent current checks");
+            }
         }
+        require(rejects([&]{MeasurementProtection invalid(1,100,15.0001);}),
+                "Reject software thresholds above the 15 V limit protected by the 17 V hardware backstop");
         for (double invalid : {std::numeric_limits<double>::quiet_NaN(),std::numeric_limits<double>::infinity()}) {
             MeasurementProtection voltage(1,100), current(1,100);
             require(rejects([&]{voltage.checkFeedback(invalid);}),"Invalid feedback trips");
             require(rejects([&]{current.checkCurrent(0,invalid,0);}),"Invalid measured current trips");
         }
-        for (double limit : {0.1,1.0,10.0}) {
+        for (double limit : {0.1,1.0,10.0,100.0}) {
             for (int sign : {-1,1}) {
                 MeasurementProtection monitor(limit,100);
                 monitor.checkCurrent(sign*limit,sign*(limit+0.0005),0);
@@ -192,6 +212,22 @@ int protectionTest() {
                 if(scenario==Fault::None)
                     require(samples>=5,"Normal continuous output continues until user stop");
             }
+        }
+        {
+            Settings settings;settings.mode=2;settings.resource="FAKE-RECONNECT-NO-HARDWARE";
+            settings.manual=true;settings.manualMA=1;settings.limitMA=1;settings.periodMs=20;
+            FakeState state;state.fault=Fault::Communication;FaultWorker worker(settings,state);
+            QString failure;int samples=0;
+            QObject::connect(&worker,&ControlThread::failed,[&](QString text){failure=text;});
+            QObject::connect(&worker,&ControlThread::sample,[&](double,double,double,double,double){
+                if(++samples>=3) worker.requestStop();
+            });
+            worker.start();
+            if(!worker.wait(12000)){worker.requestStop();worker.wait();throw std::runtime_error("Reconnect worker did not stop");}
+            require(failure.isEmpty() && state.recoveries==4 && state.reconnectAttempts==2,
+                    "Three failed in-session recoveries fall back to repeated automatic session reconnect");
+            require(samples>=3 && state.commands.size()>=3 && state.closed,
+                    "Closed-loop output resumes after reconnect state verification and stops only on user request");
         }
         {
             Settings settings;settings.mode=2;settings.resource="FAKE-NO-HARDWARE";
@@ -271,7 +307,7 @@ int protectionTest() {
             require(true,"Read back hardware protection ON, auto-on OFF, auto-off OFF on both channels");
             instrument.enable();instrument.setCurrent(0.001);
             require(std::abs(instrument.currentSetting()-0.001)<1e-10,"1 mA is sent as 0.001 A");
-            require(rejects([&]{instrument.setCurrent(0.0011);}),"Driver wrapper enforces configured 1 mA limit as well as absolute 10 mA cap");
+            require(rejects([&]{instrument.setCurrent(0.0011);}),"Driver wrapper enforces the configured 1 mA limit even though the absolute cap is 100 mA");
             require(rejects([&]{instrument.setCurrent(-0.0011);}),"Negative command cannot bypass driver limit");
             instrument.readCurrent();
             require(instrument.outputEnabled(2),"Acquisition keeps continuous output enabled");

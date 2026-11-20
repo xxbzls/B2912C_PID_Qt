@@ -1,10 +1,11 @@
 #include "traceplot.h"
 #include <QApplication>
-#include <QLabel>
 #include <QFile>
 #include <QDir>
 #include <QTextStream>
 #include <QElapsedTimer>
+#include <QEventLoop>
+#include <QTimer>
 #include <cmath>
 #include <stdexcept>
 
@@ -21,12 +22,9 @@ int plotTest() {
         TracePlot plot;plot.resize(900,440);plot.show();QApplication::processEvents();
         require(!plot.graph(0)->adaptiveSampling() && !plot.graph(1)->adaptiveSampling(),
             "Every retained mean is drawn as a polyline vertex without adaptive sampling");
-        auto* label=plot.findChild<QLabel*>("plotHoverData");
-        auto hoverAt=[&](double time){
-            mouse(plot,QEvent::MouseMove,QPoint(qRound(plot.xAxis->coordToPixel(time)),plot.axisRect()->rect().center().y()),Qt::NoButton,Qt::NoButton);
-        };
-        plot.resetData(2);hoverAt(1);
-        require(label && !label->isVisible(),"Empty plot has no stale tooltip");
+        require(!plot.hasMouseTracking() && !plot.findChild<QWidget*>("plotHoverData"),
+            "Passive mouse tracking and hover overlays are disabled");
+        plot.resetData(2);
         // Acquisition begins partway through a second, and intervals are irregular.
         plot.appendSample(.3,1,2);plot.appendSample(.5,2,2);plot.appendSample(.999,6,2);
         require(plot.graph(0)->data()->isEmpty(),"An unfinished second does not create a plotted point");
@@ -44,10 +42,7 @@ int plotTest() {
         require(plot.graph(0)->data()->size()==4 && (plot.graph(0)->data()->constBegin()+2)->key==3
             && (plot.graph(0)->data()->constEnd()-1)->key==5 && (plot.graph(0)->data()->constEnd()-1)->value==40,
             "Single-sample windows are valid and an empty second is not fabricated or merged with a later window");
-        plot.replot();hoverAt(2);
-        require(label->isVisible() && label->text().contains("1秒平均值") && label->text().contains("[1, 2) s")
-            && label->text().contains("12.000000 V"),"Hover identifies the mean and its exact integer-second window");
-        plot.replot();plot.grab().save(QDir(output).filePath("plot-average-hover.png"));
+        plot.replot();plot.grab().save(QDir(output).filePath("plot-average.png"));
 
         plot.clearData();plot.appendSample(5.3,1.9,2);plot.appendSample(6,1.8,2);
         require(plot.graph(0)->data()->size()==1 && approximatelyEqual(plot.graph(0)->data()->constBegin()->value,25.95),
@@ -61,31 +56,46 @@ int plotTest() {
         mouse(plot,QEvent::MouseButtonRelease,center,Qt::LeftButton,Qt::NoButton);
         require(plot.followsLatest(),"A normal click does not pause dynamic display");
         const auto beforeZoom=plot.xAxis->range();
+        const auto beforeZoomY=plot.yAxis->range();
         QWheelEvent wheel(QPointF(center),QPointF(plot.mapToGlobal(center)),QPoint(),QPoint(0,120),Qt::NoButton,Qt::NoModifier,Qt::NoScrollPhase,false);
         QApplication::sendEvent(&plot,&wheel);
-        require(plot.xAxis->range().size()<beforeZoom.size() && !plot.followsLatest(),"Wheel zoom changes range and pauses follow");
-        const int pausedPointCount=plot.graph(0)->data()->size();
+        const double zoomedSpan=plot.xAxis->range().size();
+        const auto zoomedYRange=plot.yAxis->range();
+        require(zoomedSpan<beforeZoom.size() && zoomedYRange.size()<beforeZoomY.size() && plot.followsLatest(),
+            "Wheel zoom preserves live X following and records the selected Y range");
+        const int zoomedPointCount=plot.graph(0)->data()->size();
+        plot.appendSample(100,20,2);plot.appendSample(101,2,2);QApplication::processEvents();
+        require(plot.followsLatest() && plot.graph(0)->data()->size()>zoomedPointCount
+            && approximatelyEqual(plot.xAxis->range().size(),zoomedSpan) && plot.xAxis->range().upper==101
+            && plot.yAxis->range()==zoomedYRange,
+            "A zoomed plot follows the latest X point while preserving the exact manual Y range despite an outside value");
         const auto beforeDrag=plot.xAxis->range();
+        const auto beforeDragY=plot.yAxis->range();
         mouse(plot,QEvent::MouseButtonPress,center,Qt::LeftButton,Qt::LeftButton);
         mouse(plot,QEvent::MouseMove,center+QPoint(70,25),Qt::NoButton,Qt::LeftButton);
+        require(plot.xAxis->range()==beforeDrag,
+            "Dragging never moves X away from the newest sample, even before mouse release");
         mouse(plot,QEvent::MouseButtonRelease,center+QPoint(70,25),Qt::LeftButton,Qt::NoButton);
-        require(std::abs(plot.xAxis->range().lower-beforeDrag.lower)>0.1,"Left drag pans the plot");
-        const auto manualRange=plot.xAxis->range();
-        plot.appendSample(100,2,2);plot.appendSample(101,2,2);QApplication::processEvents();
-        require(plot.xAxis->range()==manualRange && plot.graph(0)->data()->size()==pausedPointCount,
-            "New averaged data leaves the inspected image and ranges frozen");
+        const auto draggedYRange=plot.yAxis->range();
+        require(plot.followsLatest() && plot.xAxis->range().upper==101
+            && approximatelyEqual(plot.xAxis->range().size(),beforeDrag.size()) && draggedYRange!=beforeDragY,
+            "Dragging adjusts Y while X remains on the latest sample with the selected time span");
+        const int draggedPointCount=plot.graph(0)->data()->size();
+        plot.appendSample(102,2,2);plot.appendSample(103,2,2);QApplication::processEvents();
+        require(plot.xAxis->range().upper==103 && approximatelyEqual(plot.xAxis->range().size(),beforeDrag.size())
+            && plot.yAxis->range()==draggedYRange && plot.graph(0)->data()->size()>draggedPointCount,
+            "After dragging, new data advances X to the latest time without changing the locked Y range");
         mouse(plot,QEvent::MouseButtonDblClick,center,Qt::LeftButton,Qt::LeftButton);
         mouse(plot,QEvent::MouseButtonRelease,center,Qt::LeftButton,Qt::NoButton);
-        require(plot.followsLatest() && plot.xAxis->range().upper==101 && plot.yAxis->range().contains(2)
-            && plot.graph(0)->data()->size()>pausedPointCount,
-            "Double click restores dynamic display with every retained background point");
+        require(plot.followsLatest() && plot.xAxis->range().upper==103 && plot.yAxis->range().contains(2)
+            && plot.yAxis->range().contains(20)
+            && plot.graph(0)->data()->size()>draggedPointCount,
+            "Double click unlocks Y autoscaling and restores dynamic display with every retained background point");
         plot.resetData(-1);
         for(int i=0;i<=31010;++i)plot.appendSample(i/10.0,-1,-1);
         require(plot.graph(0)->data()->size()==3101 && plot.xAxis->range().lower==1,
             "Average history remains visible beyond 3000 points and 60 seconds");
-        plot.replot();hoverAt(10);
-        QEvent leave(QEvent::Leave);QApplication::sendEvent(&plot,&leave);
-        require(!label->isVisible(),"Leaving plot hides tooltip");
+        plot.replot();
 
         plot.resetData(4);
         for(int i=0;i<=100;++i) plot.appendSample(i/10.0,i<55 ? 3.9 : 5.9,i<55 ? 4 : 6);
@@ -94,11 +104,6 @@ int plotTest() {
             && changes->constBegin()->value==4 && approximatelyEqual((changes->constBegin()+1)->key,5.5)
             && (changes->constEnd()-1)->value==6 && plot.graph(1)->lineStyle()==QCPGraph::lsStepLeft,
             "Target remains an unsmoothed step at its true application time inside a second");
-        hoverAt(2);
-        require(label->text().contains("目标电压（窗末时刻）：4.000000 V") && label->text().contains("0.100000 V"),"Old mean retains the historical target");
-        hoverAt(6);
-        require(label->text().contains("探头电压：4.900000 V") && label->text().contains("目标电压（窗末时刻）：6.000000 V"),
-            "A window spanning a target step shows its true voltage mean and explicitly labels the end-time target");
         plot.xAxis->setRange(0,4);
         require(plot.graph(1)->data()->constBegin()->value==4 && (plot.graph(1)->data()->constEnd()-1)->value==4,"Panning to old history keeps the old target");
         plot.restoreView();plot.replot();plot.grab().save(QDir(output).filePath("plot-target-change.png"));
@@ -115,10 +120,7 @@ int plotTest() {
             "Output and measured currents average separately over the same second and sample count");
         require(plot.yAxis->range().contains(-1.5) && plot.yAxis->range().contains(.2) && plot.yAxis->range().upper<1,
             "Current autoscaling includes both means and ignores a voltage target");
-        hoverAt(1);
-        require(label->isVisible() && label->text().contains("1秒平均值") && label->text().contains("输出电流：-1.500000 mA")
-            && label->text().contains("实测电流：0.200000 mA"),"Current tooltip shows two separately averaged values");
-        plot.replot();plot.grab().save(QDir(output).filePath("plot-current-hover.png"));
+        plot.replot();plot.grab().save(QDir(output).filePath("plot-current.png"));
         plot.clearData();plot.appendCurrentSample(1.1,-.1,-.09);plot.appendCurrentSample(2,0,0);
         require(plot.graph(0)->data()->size()==1 && approximatelyEqual(plot.graph(0)->data()->constBegin()->value,-4.55)
             && approximatelyEqual(plot.graph(1)->data()->constBegin()->value,1.455),"Current clear preserves the shared second window for both curves");
@@ -146,17 +148,21 @@ int plotTest() {
         require(labels.contains("24:00:00"),"Time axis reaches 24:00:00 without wrapping");
         QElapsedTimer renderClock;renderClock.start();plot.replot();dayCurrent.replot();
         results<<QString("INFO Full-day voltage/current repaint: %1 ms").arg(renderClock.elapsed());
-        plot.xAxis->setRange(2.5,3.5);plot.yAxis->setRange(1.8,2.5);plot.replot();hoverAt(3);
-        require(label->isVisible() && label->text().contains("2.300000 V") && label->text().contains("[2, 3) s"),
-            "Zoom and hover recover the correct earliest-day mean and window");
+        plot.xAxis->setRange(2.5,3.5);plot.yAxis->setRange(1.8,2.5);plot.replot();
+        const auto earlyMean=plot.graph(0)->data()->findBegin(3,false);
+        require(earlyMean!=plot.graph(0)->data()->constEnd() && earlyMean->key==3
+            && approximatelyEqual(earlyMean->value,2.3),
+            "Zoomed history retains the exact earliest-day mean and window endpoint");
         plot.restoreView();const auto entireRange=plot.xAxis->range();
         QWheelEvent dayWheel(QPointF(plot.axisRect()->rect().center()),QPointF(plot.mapToGlobal(plot.axisRect()->rect().center())),
             QPoint(),QPoint(0,120),Qt::NoButton,Qt::NoModifier,Qt::NoScrollPhase,false);
         QApplication::sendEvent(&plot,&dayWheel);
-        require(!plot.followsLatest() && plot.xAxis->range().size()<entireRange.size(),"Full-day history remains zoomable");
-        const auto inspectedRange=plot.xAxis->range();
+        const double dayZoomSpan=plot.xAxis->range().size();
+        require(plot.followsLatest() && dayZoomSpan<entireRange.size(),
+            "Full-day history remains zoomable while following live data");
         for(int i=864011;i<=864050;++i) {plot.appendSample(i/10.0,2,2.02);dayCurrent.appendCurrentSample(i/10.0,.2,.201);}
-        require(plot.xAxis->range()==inspectedRange,"Rolling expiry preserves a manually zoomed view");
+        require(approximatelyEqual(plot.xAxis->range().size(),dayZoomSpan) && plot.xAxis->range().upper==86405,
+            "Rolling expiry preserves the zoom span and keeps the newest mean visible");
         plot.restoreView();dayCurrent.restoreView();
         require(plot.graph(0)->data()->size()==86401 && plot.graph(0)->data()->constBegin()->key==5
             && dayCurrent.graph(0)->data()->constBegin()->key==5 && dayCurrent.graph(1)->data()->constBegin()->key==5,
@@ -167,6 +173,73 @@ int plotTest() {
             "Target changes survive the rolling day boundary");
         plot.replot();plot.grab().save(QDir(output).filePath("plot-24-hours.png"));
         dayCurrent.replot();dayCurrent.grab().save(QDir(output).filePath("plot-current-24-hours.png"));
+
+        // Keep both production plot widgets live with a complete 24-hour history.
+        // A 10 ms heartbeat measures real GUI-thread stalls while 10 Hz samples,
+        // delayed repaint timers, zooming, dragging, restoring and resizing all run.
+        TracePlot stressVoltage;TracePlot stressCurrent;stressCurrent.setCurrentMode(true);
+        for(int i=0;i<=864010;++i) {
+            const double seconds=i/10.0;
+            stressVoltage.appendSample(seconds,2+.02*std::sin(seconds*6),2.02);
+            stressCurrent.appendCurrentSample(seconds,.2+.02*std::sin(seconds/3600),.201+.02*std::sin(seconds/3600));
+        }
+        stressVoltage.resize(1520,360);stressCurrent.resize(1520,360);
+        stressVoltage.show();stressCurrent.show();
+        QApplication::processEvents();
+        int voltageFrames=0,currentFrames=0,heartbeatCount=0,gapsOver50Ms=0;
+        qint64 maxHeartbeatGapMs=0,lastHeartbeatMs=0;
+        QObject::connect(&stressVoltage,&QCustomPlot::afterReplot,&stressVoltage,[&]{++voltageFrames;});
+        QObject::connect(&stressCurrent,&QCustomPlot::afterReplot,&stressCurrent,[&]{++currentFrames;});
+        QElapsedTimer heartbeatClock;heartbeatClock.start();
+        QTimer heartbeat;heartbeat.setTimerType(Qt::PreciseTimer);heartbeat.setInterval(10);
+        QObject::connect(&heartbeat,&QTimer::timeout,&stressVoltage,[&]{
+            const qint64 now=heartbeatClock.elapsed();
+            if(lastHeartbeatMs) {
+                const qint64 gap=now-lastHeartbeatMs;
+                maxHeartbeatGapMs=std::max(maxHeartbeatGapMs,gap);
+                if(gap>50)++gapsOver50Ms;
+            }
+            lastHeartbeatMs=now;++heartbeatCount;
+        });
+        int liveTick=864010;
+        QTimer input;input.setTimerType(Qt::PreciseTimer);input.setInterval(100);
+        QObject::connect(&input,&QTimer::timeout,&stressVoltage,[&]{
+            const double seconds=++liveTick/10.0;
+            stressVoltage.appendSample(seconds,2+.02*std::sin(seconds*6),2.02);
+            stressCurrent.appendCurrentSample(seconds,.2+.02*std::sin(seconds/3600),.201+.02*std::sin(seconds/3600));
+        });
+        QTimer::singleShot(1500,&stressVoltage,[&]{
+            const QPoint p=stressVoltage.axisRect()->rect().center();
+            QWheelEvent event(QPointF(p),QPointF(stressVoltage.mapToGlobal(p)),QPoint(),QPoint(0,120),
+                Qt::NoButton,Qt::NoModifier,Qt::NoScrollPhase,false);
+            QApplication::sendEvent(&stressVoltage,&event);
+        });
+        QTimer::singleShot(3300,&stressVoltage,[&]{
+            const QPoint p=stressVoltage.axisRect()->rect().center();
+            mouse(stressVoltage,QEvent::MouseButtonPress,p,Qt::LeftButton,Qt::LeftButton);
+            mouse(stressVoltage,QEvent::MouseMove,p+QPoint(90,20),Qt::NoButton,Qt::LeftButton);
+            mouse(stressVoltage,QEvent::MouseButtonRelease,p+QPoint(90,20),Qt::LeftButton,Qt::NoButton);
+        });
+        QTimer::singleShot(5100,&stressVoltage,[&]{
+            const QPoint p=stressVoltage.axisRect()->rect().center();
+            mouse(stressVoltage,QEvent::MouseButtonDblClick,p,Qt::LeftButton,Qt::LeftButton);
+            mouse(stressVoltage,QEvent::MouseButtonRelease,p,Qt::LeftButton,Qt::NoButton);
+        });
+        QTimer::singleShot(6500,&stressVoltage,[&]{stressVoltage.resize(1180,330);stressCurrent.resize(1180,330);});
+        QTimer::singleShot(7100,&stressVoltage,[&]{stressVoltage.resize(1520,360);stressCurrent.resize(1520,360);});
+        QEventLoop liveStress;
+        QTimer::singleShot(8000,&liveStress,&QEventLoop::quit);
+        heartbeat.start();input.start();liveStress.exec();input.stop();heartbeat.stop();
+        QApplication::processEvents();
+        results<<QString("INFO 24-hour live GUI stress: max heartbeat gap %1 ms; gaps >50 ms %2; "
+                         "heartbeats %3; voltage/current repaints %4/%5")
+                     .arg(maxHeartbeatGapMs).arg(gapsOver50Ms).arg(heartbeatCount)
+                     .arg(voltageFrames).arg(currentFrames);
+        require(heartbeatCount>=500 && maxHeartbeatGapMs<150,
+            "A full-day two-plot live run remains responsive through zoom, drag, restore and resize");
+        require(stressVoltage.followsLatest() && stressVoltage.xAxis->range().upper>=86408,
+            "The stress-test plot resumes following the newest data after historical inspection");
+
         plot.clearData();dayCurrent.clearData();
         plot.appendSample(86405.5,1.9,2.02);plot.appendSample(86406,1.8,2.02);
         dayCurrent.appendCurrentSample(86405.5,-.1,-.09);dayCurrent.appendCurrentSample(86406,0,0);

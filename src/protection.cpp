@@ -13,9 +13,11 @@
 
 [[noreturn]] static void fail(const QString& message) { throw std::runtime_error(message.toUtf8().constData()); }
 
-MeasurementProtection::MeasurementProtection(double limitMA, int periodMs)
-    : limit(limitMA), period(periodMs/1000.0) {
-    if (!std::isfinite(limit) || limit <= 0 || limit > 10 || periodMs < 20 || periodMs > 2000)
+MeasurementProtection::MeasurementProtection(double limitMA, int periodMs, double feedbackLimitV)
+    : limit(limitMA), feedbackLimit(feedbackLimitV), period(periodMs/1000.0) {
+    if (!std::isfinite(limit) || limit <= 0 || limit > 100
+        || !std::isfinite(feedbackLimit) || feedbackLimit < 0.1 || feedbackLimit > 15
+        || periodMs < 20 || periodMs > 2000)
         fail("Invalid measurement protection settings");
 }
 void MeasurementProtection::checkLatched() const { if (!fault.isEmpty()) fail(fault); }
@@ -23,8 +25,9 @@ void MeasurementProtection::trip(const QString& reason) { fault = reason; fail(f
 void MeasurementProtection::checkFeedback(double volts) {
     checkLatched();
     if (!std::isfinite(volts)) trip("保护停机：CH1 探头电压无效。");
-    if (std::abs(volts) > 10.0)
-        trip(QString("保护停机：CH1 探头电压 %1 V 超出 ±10 V。").arg(volts,0,'g',12));
+    if (std::abs(volts) > feedbackLimit)
+        trip(QString("保护停机：CH1 探头电压 %1 V 超出设定阈值 ±%2 V。")
+             .arg(volts,0,'g',12).arg(feedbackLimit,0,'g',12));
 }
 double MeasurementProtection::currentToleranceMA() const { return std::max(0.005, 0.001*limit); }
 double MeasurementProtection::mismatchDurationSeconds() const { return std::max(0.5, 3*period); }
