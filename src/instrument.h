@@ -48,19 +48,19 @@ private:
     bool configured = false;
     bool runConfigured = false, monitoringSession = false;
     bool currentTestOnly = false;
-    bool simulated = false, interfaceLocked = false;
+    bool simulated = false;
     bool rawQueryPending = false;
     QElapsedTimer diagnosticTimer;
-    // Slow-changing state (lock owner, grouping, compliance flags, error queue)
+    // Slow-changing state (grouping, compliance flags, error queue)
     // is verified at most once per interval to keep USB traffic low; the
     // hardware protection register is still read on every call.
     static constexpr qint64 fullCheckIntervalMs = 1000;
-    QElapsedTimer ownershipTimer, fullCheckTimer;
+    QElapsedTimer fullCheckTimer;
     bool fullCheckDue() const;
     void pollInstrumentErrors(bool strict = false);
     bool handleInstrumentError(ViInt32 code, const QString& text, bool duringRecovery);
     double currentLimitAmps = 0.01;
-    QString interfaceName, lockedSerial;
+    QString lockedSerial;
     ProcessLock deviceLock;
     QByteArray out[2], meas[2];
     void check(ViStatus status, const char* operation);
@@ -83,7 +83,7 @@ private:
     API(MeasurementInitiate) API(SystemWaitForOperationComplete) API(MeasurementFetchScalarData)
     API(MeasurementAbort) API(TransientAbort)
     API(MeasurementFunctionDisableAll) API(MeasurementFunctionSetEnabled) API(MeasurementFunctionGetEnabled)
-    API(SystemRequestLock) API(SystemReleaseLock) API(SystemLockName) API(SystemLockOwner)
+    API(SystemLockOwner)
     API(SystemResetChannelGroups) API(viWrite) API(SystemReadBytes) API(SystemClearIO)
     API(StatusQuestionableReadConditionRegister)
     API(SetSystemTracingEnabled) API(SetSystemTracingFileName) API(SetSystemTracingLevel)

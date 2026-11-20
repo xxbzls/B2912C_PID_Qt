@@ -10,10 +10,10 @@
 | `KTB2900_ATTR_OUTPUT_AUTO_ON_ENABLED` | 显式关闭，避免保护后由测量触发再次开启 |
 | `KTB2900_ATTR_OUTPUT_AUTO_OFF_ENABLED` | 显式关闭，保持正常连续电流输出 |
 | `KtB2900_StatusQuestionableReadConditionRegister` | 读取输出保护标志，bit2为CH1、bit3为CH2；使用C/CL SCPI手册279页的定义（CHM该函数的枚举列表不完整） |
-| `KtB2900_SystemLockName/SystemLockOwner` | 读取当前接口和锁持有者 |
-| `KtB2900_SystemRequestLock/SystemReleaseLock` | 申请、成对释放仪器接口锁，已有持有者时拒绝接管 |
+| `KtB2900_SystemLockOwner` | 连接时检查是否已有其他 I/O 会话锁定仪器；只用于拒绝接管其他会话 |
+| `KtB2900_SystemRequestLock/SystemReleaseLock` | 当前程序不再调用，避免 USB 拔插后旧会话锁残留而阻止重连 |
 
-接口锁范围是I/O接口，**不能代替同一接口多个程序之间的协调**。本工程另外增加本机固定内核互斥对象和按序列号的设备锁；旧程序、Interactive IO等未使用这些锁的软件仍需退出控制会话。接口锁会锁定仪器面板（包括Local键），断开时释放。`KtB2900_LockSession`仅为驱动多线程锁，没有用于跨程序互斥。[官方SCPI参考，220、279、304–306页](https://www.keysight.com.cn/cn/zh/assets/9925-01426/programming-guides/B2900C-CL-Series-Precision-Source-Measure-Unit-SCPI-Command-Reference.pdf)
+仪器 SCPI 锁属于取得它的 I/O 会话。现场 USB 拔插测试证明旧会话消失后仪器可能继续保留锁，新会话即使仍是同一 USB 接口也会收到 `VI_ERROR_NCIC` 和错误 202，不能安全继承该锁。因此 2026-11-20 起真实连接不再申请仪器 SCPI 锁，仅保留按仪器序列号命名的 Windows 全局互斥对象；旧程序、Connection Expert、TestStation、Interactive IO 和其他电脑未参与该互斥，程序运行时必须退出这些控制会话。`KtB2900_LockSession`仅为驱动多线程锁，没有用于跨程序互斥。[官方SCPI参考，304–306页](https://www.keysight.com.cn/cn/zh/assets/9925-01426/programming-guides/B2900C-CL-Series-Precision-Source-Measure-Unit-SCPI-Command-Reference.pdf)
 
 软件保护入口在 `src/protection.cpp`，控制线程在实测电压后、下一次设流前检查±10 V；取得CH2实测电流后检查过流及持续偏差。检测阈值、容差、恢复流程见README“运行保护”。单位继续为界面mA、SDK A，1 mA按0.001 A下发。
 

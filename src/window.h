@@ -37,7 +37,7 @@ private:
     SessionThread* session = nullptr;
     bool sessionReady = false;
     bool active = false;
-    bool stopping = false, targetPending = false;
+    bool stopping = false, targetPending = false, communicationRecovering = false;
     bool preparingControl = false, notifyStopped = false, storageFailed = false, recorderFinished = false;
     DataRecorder* recorder = nullptr;
     QString identity;

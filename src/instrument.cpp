@@ -78,7 +78,7 @@ QString Instrument::open(const QString& resource, bool simulation, bool resetOnO
     LOAD(MeasurementInitiate) LOAD(SystemWaitForOperationComplete) LOAD(MeasurementFetchScalarData)
     LOAD(MeasurementAbort) LOAD(TransientAbort)
     LOAD(MeasurementFunctionDisableAll) LOAD(MeasurementFunctionSetEnabled) LOAD(MeasurementFunctionGetEnabled)
-    LOAD(SystemRequestLock) LOAD(SystemReleaseLock) LOAD(SystemLockName) LOAD(SystemLockOwner)
+    LOAD(SystemLockOwner)
     LOAD(SystemResetChannelGroups) LOAD(viWrite) LOAD(SystemReadBytes) LOAD(SystemClearIO)
     LOAD(StatusQuestionableReadConditionRegister)
     LOAD(SetSystemTracingEnabled) LOAD(SetSystemTracingFileName) LOAD(SetSystemTracingLevel)
@@ -89,18 +89,10 @@ QString Instrument::open(const QString& resource, bool simulation, bool resetOnO
         ? "Cache=false, Simulate=true, QueryInstrStatus=true, DriverSetup=Model=B2912C"
         : "Cache=false, Simulate=false, QueryInstrStatus=false"; // Error queue is polled explicitly.
     // Normal connections preserve state. configure() snapshots compliance before resetting.
-    // Never reset until exclusive control has been obtained.
-    ownershipTimer.invalidate(); fullCheckTimer.invalidate();
+    // Never reset until the instrument identity and process-wide lock are verified.
+    fullCheckTimer.invalidate();
     check(InitWithOptions(address.data(), VI_TRUE, VI_FALSE, options, &session), "InitWithOptions");
     sdkDiagnostic("SESSION_OPEN resource="+resource+" simulated="+QString::number(simulation));
-    if(!simulation && !lockedSerial.isEmpty()) {
-        // The instrument error queue outlives a failed SDK session. Clear the
-        // new transport boundary and remove only stale query-boundary errors
-        // before any identity/property query can surface the old -420 again.
-        check(SystemClearIO(session),"Clear newly reconnected session");
-        rawQueryPending=false;
-        drainRecoveryErrors();
-    }
     if(!simulation) {
         const QByteArray tracePath=QDir::toNativeSeparators(QCoreApplication::applicationDirPath()+
             "/Diagnostics/driver_"+QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss_zzz")+".log").toLocal8Bit();
@@ -142,31 +134,17 @@ QString Instrument::open(const QString& resource, bool simulation, bool resetOnO
             fail(QString("自动重连识别到不同仪器（原序列号 %1，新序列号 %2），拒绝继续输出。")
                  .arg(lockedSerial,normalizedSerial));
         }
-        char owner[256] = {}, name[256] = {};
+        char owner[256] = {};
         check(SystemLockOwner(session,sizeof(owner),owner),"Read interface lock owner");
         const QString currentOwner = QString::fromLatin1(owner).trimmed().remove('"');
-        check(SystemLockName(session,sizeof(name),name),"Read interface name");
-        const QString previousInterface = interfaceName;
-        interfaceName = QString::fromLatin1(name).trimmed().remove('"');
-        sdkDiagnostic("LOCK_STATE owner="+currentOwner+" interface="+interfaceName+" reconnect="+QString::number(reconnecting));
-        if (currentOwner.compare("NONE",Qt::CaseInsensitive) != 0) {
-            // After a USB drop the instrument keeps the lock of the interface this
-            // process already owns (serial verified above, process-wide device lock
-            // still held). Adopt it instead of requesting a nested lock.
-            if (!reconnecting || currentOwner.compare(interfaceName,Qt::CaseInsensitive) != 0
-                || previousInterface.compare(interfaceName,Qt::CaseInsensitive) != 0)
-                fail("仪器接口已被占用（" + currentOwner + "），请先释放原控制会话；不会抢占或复位。");
-            interfaceLocked = true;
-            if (log) log("自动重连：仪器仍保留本机 " + interfaceName + " 接口的控制锁，直接沿用。");
-        } else {
-            ViBoolean granted = VI_FALSE;
-            const ViStatus lockStatus = SystemRequestLock(session,&granted);
-            interfaceLocked = granted == VI_TRUE;
-            check(lockStatus,"Request instrument interface lock");
-            if (!interfaceLocked) fail("仪器拒绝控制锁，尚未配置或开启输出。");
-        }
+        sdkDiagnostic("SCPI_LOCK_STATE owner="+currentOwner+" reconnect="+QString::number(reconnecting));
+        if (currentOwner.compare("NONE",Qt::CaseInsensitive) != 0)
+            fail("仪器被另一个 I/O 会话锁定（" + currentOwner
+                 + "）。请关闭 Connection Expert/TestStation 等会话；若为旧程序残留锁，请先在面板关断输出并重启仪器。");
         verifyControlOwnership();
-        if (log) log("已取得仪器控制锁；断开连接时释放。仪器面板在接口锁期间会锁定。");
+        if (log) log(reconnecting
+            ? "自动重连：已确认仍是原仪器，并继续持有本机进程互斥锁；未申请会阻碍 USB 拔插恢复的 SCPI 会话锁。"
+            : "已取得本机进程互斥控制权；为支持 USB 拔插自动重连，不申请仪器 SCPI 会话锁。运行期间请勿使用 Connection Expert/TestStation 等其他软件控制仪器。");
     }
     if (resetOnOpen) { configured = true; resetForRun(); }
     return QString("%1 | 序列号 %2 | 固件 %3").arg(QString::fromLatin1(model).trimmed(), QString::fromLatin1(serial).trimmed(), QString::fromLatin1(firmware).trimmed());
@@ -528,13 +506,8 @@ void Instrument::verifyOutputProtection() {
 }
 void Instrument::verifyControlOwnership() {
     if (simulated) return;
-    if (!session || !interfaceLocked) fail("未取得仪器控制锁，拒绝控制。");
-    if (ownershipTimer.isValid() && ownershipTimer.elapsed() < fullCheckIntervalMs) return;
-    char owner[256] = {};
-    check(SystemLockOwner(session,sizeof(owner),owner),"Verify instrument interface lock");
-    if (QString::fromLatin1(owner).trimmed().remove('"') != interfaceName)
-        fail("仪器控制锁已丢失，停止运行并尝试关断输出。");
-    ownershipTimer.start();
+    if (!session || lockedSerial.isEmpty())
+        fail("未持有原仪器的本机进程互斥控制权，拒绝控制。");
 }
 // Returns true if the entry was cleared and operation may continue.
 bool Instrument::handleInstrumentError(ViInt32 code, const QString& text, bool duringRecovery) {
@@ -595,7 +568,7 @@ void Instrument::recoverCommunication() {
     try {check(SystemClearIO(session),"Recover communication boundary");}
     catch(...) {rawQueryPending=true;throw;}
     rawQueryPending=false;
-    ownershipTimer.invalidate(); fullCheckTimer.invalidate();
+    fullCheckTimer.invalidate();
     drainRecoveryErrors();
     verifyControlOwnership();
     verifyIndependentChannels();
@@ -606,7 +579,6 @@ QString Instrument::reconnect(const QString& resource) {
     if(simulated || lockedSerial.isEmpty()) fail("自动重连要求仍持有原仪器的本机控制锁。");
     const ViSession staleSession=session;
     session=VI_NULL;
-    interfaceLocked=false;
     rawQueryPending=false;
     if(staleSession && close) {
         const ViStatus closeStatus=close(staleSession);
@@ -620,7 +592,6 @@ QString Instrument::reconnect(const QString& resource) {
     } catch(...) {
         const ViSession failedSession=session;
         session=VI_NULL;
-        interfaceLocked=false;
         rawQueryPending=false;
         if(failedSession && close) close(failedSession);
         throw;
@@ -667,11 +638,6 @@ void Instrument::disableOutput(int channel) {
 QStringList Instrument::shutdown() {
     QStringList errors=stopOutputs();
     if (!session) { deviceLock.release(); lockedSerial.clear(); return errors; }
-    if (interfaceLocked) {
-        try { check(SystemReleaseLock(session),"Release instrument interface lock"); }
-        catch(const std::exception& e) { errors << QString::fromUtf8(e.what()); }
-        interfaceLocked = false;
-    }
     try { check(close(session), "Close"); }
     catch(const std::exception& e) { errors << QString::fromUtf8(e.what()); }
     session = VI_NULL; configured = false; runConfigured = false; monitoringSession = false; rawQueryPending = false;

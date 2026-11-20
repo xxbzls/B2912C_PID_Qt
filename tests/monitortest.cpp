@@ -158,13 +158,15 @@ int monitorTest() {
                 && !session.startControl(settings),QString("Fault %1 closes both channels, reports failure and never resumes monitoring or control automatically").arg(fault));
         }
         {
-            State state;MonitorSession session(settings,state);QObject receiver;int idle=0;QStringList errors;
+            State state;MonitorSession session(settings,state);QObject receiver;int idle=0;QStringList errors;QVector<bool> recoveryStates;
             QObject::connect(&session,&ControlThread::monitorSample,&receiver,[&]{++idle;});
             QObject::connect(&session,&ControlThread::failed,&receiver,[&](QString e){errors<<e;});
+            QObject::connect(&session,&ControlThread::recoveryStateChanged,&receiver,[&](bool recovering){recoveryStates<<recovering;});
             session.start();waitUntil([&]{return idle>=2;});const int before=idle;state.fault=7;
             waitUntil([&]{return idle>=before+2;},12000);
-            require(session.isRunning() && errors.isEmpty() && state.recoveries==4 && state.reconnects==1,
-                    "Idle monitoring rebuilds the session after three failed in-session communication recoveries");
+            require(session.isRunning() && errors.isEmpty() && state.recoveries==4 && state.reconnects==1
+                    && recoveryStates==QVector<bool>({true,false}),
+                    "Idle monitoring exposes recovery state and rebuilds the session after three failed in-session recoveries");
             session.disconnectDevice();session.wait();
             require(state.closed && !state.ch1 && !state.ch2,"Recovered monitoring session still obeys explicit disconnect");
         }

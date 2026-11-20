@@ -38,7 +38,7 @@ void Window::testConnection() {
     refreshControls();
     showConnectionStatus(simulation ? "正在连接模拟驱动……" : "正在连接 B2912C……","#536575");
     clearLiveReadings("正在连接，等待探头采集。");
-    append("开始连接：核对身份并申请控制锁；开启 CH1 的 0 A 测压，CH2 保持关断，不改写 CH2 电流设定或电压上限。");
+    append("开始连接：核对身份并申请本机进程互斥控制权；开启 CH1 的 0 A 测压，CH2 保持关断，不改写 CH2 电流设定或电压上限。");
     attachSignals(session);
     connect(session,&ControlThread::connected,this,[this,simulation](QString details){
         if(closing)return;
@@ -55,7 +55,7 @@ void Window::testConnection() {
         finishRun();
     });
     connect(session,&QThread::finished,this,[this]{
-        session->deleteLater();session=nullptr;sessionReady=false;
+        session->deleteLater();session=nullptr;sessionReady=false;communicationRecovering=false;
         voltageLimitStatus->setText("已断开，重新连接后读取");
         clearLiveReadings(hadError ? "采集已停止，请查看异常信息。" : "已断开，实时采集已停止。");
         if(!hadError)showConnectionStatus("已断开 · 请先连接电源再启动控制","#536575");
@@ -67,7 +67,7 @@ void Window::testConnection() {
 void Window::refreshControls() {
     const bool waiting=session && !sessionReady;
     const bool editable=!active && !waiting && !closing && !recorder;
-    const bool livePid=active && sampleCount>0 && sessionReady && !hadError && !stopping && !closing
+    const bool livePid=active && sampleCount>0 && sessionReady && !hadError && !communicationRecovering && !stopping && !closing
         && !activeSettings.manual;
     parameters->setEnabled(!waiting && !closing);
     for(auto* w : {kp,ti,td}) w->setEnabled(editable);
@@ -92,6 +92,10 @@ void Window::refreshLoopState() {
     QString color="#9ca3af",text="闭环未使能",state="idle";
     if(hadError) {color="#dc2626";text="闭环故障";state="fault";}
     else if(active && (stopping || closing)) {color="#d97706";text="正在停止";state="stopping";}
+    else if(communicationRecovering) {
+        color="#d97706";state="recovering";
+        text=active ? (activeSettings.manual ? "手动输出通信恢复中" : "闭环通信恢复中") : "闭环未使能 · 通信恢复中";
+    }
     else if(active && !activeSettings.manual) {
         if(preparingControl || sampleCount==0) {color="#d97706";text="闭环启动中";state="starting";}
         else {color="#16a34a";text="闭环已使能";state="running";}
@@ -123,7 +127,7 @@ void Window::start(bool isManual) {
     Settings s;s.mode=driverSimulation ? 1 : 2;s.resource=resource->text();s.targetV=target->value();s.kp=kp->value();s.ti=ti->value();s.td=td->value();s.limitMA=limit->value();s.probeVoltageLimit=probeVoltageLimit->value();s.voltageLimit=voltageLimit->value();s.overrideVoltageLimit=overrideVoltageLimit->isChecked();s.nplc=nplc->value();s.manualMA=manual->value();s.direction=direction->currentIndex()==0?1:-1;s.periodMs=period->value();s.manual=isManual;
     s.currentTest=false;
     try{s.validate();}catch(const std::exception& e){hadError=true;append(QString::fromUtf8(e.what()));return;}
-    hadError=false;sampleCount=0;activeSettings=s;active=true;preparingControl=true;stopping=false;targetPending=false;storageFailed=false;
+    hadError=false;sampleCount=0;activeSettings=s;active=true;preparingControl=true;stopping=false;targetPending=false;communicationRecovering=false;storageFailed=false;
     clearLiveReadings("正在准备控制，等待新的实时采样。");
     trace->resetData(s.targetV);currentTrace->resetData(s.manual ? s.manualMA : 0);
     if(!saveData->isChecked()) {storageStatus->setStyleSheet("color:#536575;");storageStatus->setText("本次未启用数据存储。");refreshControls();beginControl();return;}
@@ -159,7 +163,7 @@ void Window::beginControl() {
 }
 void Window::finishRun() {
     notifyStopped=notifyStopped || active;
-    active=false;preparingControl=false;stopping=false;targetPending=false;
+    active=false;preparingControl=false;stopping=false;targetPending=false;communicationRecovering=false;
     if(recorder)recorder->finish();
     releaseRecorder();
 }
@@ -187,11 +191,22 @@ void Window::applyTarget() {
 }
 void Window::attachSignals(ControlThread* thread) {
     connect(thread,&ControlThread::message,this,&Window::append);
+    connect(thread,&ControlThread::recoveryStateChanged,this,[this](bool recovering){
+        communicationRecovering=recovering;
+        if(recovering) {
+            clearLiveReadings("通信中断，PID/采集已暂停，正在自动恢复连接。");
+            showConnectionStatus("通信中断 · 正在自动恢复原仪器连接","#d97706");
+        } else if(!hadError && sessionReady) {
+            showConnectionStatus(active ? "已连接 · "+identity+" · 控制运行中"
+                                        : "已连接 · "+identity+" · CH1 持续采集，CH2 已关断","#18703c");
+        }
+        refreshControls();
+    });
     connect(thread,&ControlThread::voltageLimitRead,this,[this](double volts){
         voltageLimitStatus->setText(QString("%1仪器读回：±%2 V").arg(driverSimulation ? "【仿真】" : "").arg(volts,0,'g',8));
     });
     connect(thread,&ControlThread::failed,this,[this](QString message){
-        hadError=true;sessionReady=false;targetPending=false;append("错误："+message);
+        hadError=true;sessionReady=false;targetPending=false;communicationRecovering=false;append("错误："+message);
         clearLiveReadings("采集异常，当前实时值不可用。");
         showConnectionStatus("连接或运行异常 · "+message,"#b42318");refreshControls();
     });

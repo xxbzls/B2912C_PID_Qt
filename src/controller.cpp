@@ -108,6 +108,8 @@ bool ControlThread::takeTargetVoltage(double& volts) {
 bool ControlThread::recoverInstrument(Instrument& instrument, const QString& initialError,
                                       const std::function<void()>& verifyState) {
     sdkDiagnostic("RECOVERY_BEGIN "+initialError);
+    emit recoveryStateChanged(true);
+    const auto recoveryStateCleanup=qScopeGuard([this]{emit recoveryStateChanged(false);});
     QElapsedTimer outage;outage.start();
     const auto outageText=[&]{return QString("中断时长 %1 s").arg(outage.elapsed()/1000.0,0,'f',1);};
     emit message("通信异常，PID/采集已暂停，软件不主动改写输出；仪器未重启时会保持最后一次设定。先修复当前会话，必要时自动重连："+initialError);

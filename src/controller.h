@@ -59,6 +59,7 @@ signals:
     void targetApplied(double volts);
     void recordData(const RecordSample& sample); // Direct connection to recorder's bounded queue.
     void message(QString text);
+    void recoveryStateChanged(bool recovering);
     void failed(QString text);
     void runStopped();
 protected:
